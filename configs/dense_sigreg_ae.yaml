@@ -1,0 +1,46 @@
+# Dense-SIGReg-AE: reconstruction + lambda * Epps-Pulley SIGReg. Sweep lambda in {0.01, 0.1, 1}.
+name: dense_sigreg_ae
+data:
+  activation_manifest: ""        # set with --set data.activation_manifest=... or the launcher
+  normalization_path: ""         # train-only mu, s from sj-compute-normalization
+  skip_burn_in: true
+  shards_per_window: 4
+  test_split: auto               # manifest test split, else hold out half the validation shards
+  holdout_test_fraction: 0.5
+model:
+  type: dense_sigreg_ae
+  d_in: 0                        # 0 = from manifest (4096 for Pythia-6.9B)
+  d_hidden: 4096
+  d_latent: 4096
+  activation: gelu
+sigreg:
+  weight: 0.1
+  num_projections: 256
+  t_min: -5.0
+  t_max: 5.0
+  num_points: 17
+  scale_by_batch_size: true
+  resample_every_step: true
+  validation_projections: 256
+optim:
+  batch_size: 512
+  lr: 1.0e-4
+  weight_decay: 0.0
+  warmup_steps: 1000
+  decay_fraction: 0.2
+  steps: 10000
+  gradient_clip: 0.0
+  amp_dtype: bfloat16
+train:
+  seed: 42
+  output_dir: runs/stage1/dense-sigreg-ae
+  device: cuda
+  log_every: 100
+  validation_every: 1000
+  validation_batches: 16
+  checkpoint_every: 2000
+eval:
+  batch_size: 512
+  batches: 64
+  diagnostic_projections: 256
+  diagnostic_seed: 777
