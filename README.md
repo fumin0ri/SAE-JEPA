@@ -1,7 +1,7 @@
 # SAE-JEPA
 
 LLM残差ストリームに対し、**Top-K SAEの前段として「再構成＋SIGReg」で密なGaussian化表現を作る**ための実験コードです。
-[JEPA-SAE](https://github.com/fumin0ri/JEPA-SAE) の活性抽出フォーマット（`sr-extract-pile`）をそのまま読み込みます。
+[LeJEPA-SAE](https://github.com/fumin0ri/LeJEPA-SAE)（`extract`、safetensors）と [JEPA-SAE](https://github.com/fumin0ri/JEPA-SAE)（`sr-extract-pile`）の活性抽出フォーマットをそのまま読み込みます。
 
 本リポジトリは **第1段階**（密な前段表現の学習と評価）を実装しています。第2段階では、ここで学習したencoderと正規化統計を固定し、Raw・PCA whitening・Dense-AE・Dense-SIGReg-AEの各前段を同じTopK SAEへ接続します（共通インターフェース `encode_dense(h)`、`sae_jepa.frontends`）。
 
@@ -52,11 +52,18 @@ pip install -e ".[dev]"
 
 ## データ
 
-JEPA-SAEの `sr-extract-pile` で作成した `manifest.json`（`shared-residual-sequence-shards-v2`）を使います。
-各系列の `[burn_in_tokens, valid_length)` の位置を独立サンプルとして扱います（`data.skip_burn_in`）。
+`ACTIVATION_MANIFEST`（`data.activation_manifest`）には、次のどちらの `manifest.json` も指定できます。形式は自動判定します。
+
+| 抽出元 | manifest | shard | 使う位置 |
+|---|---|---|---|
+| LeJEPA-SAE `extract` | `format_version: 1`、`d_llm`、`shards[].split / sequences[].offset,length` | `*.safetensors`（`activations: [num_tokens, d]`） | 全トークン（burn-inなし） |
+| JEPA-SAE `sr-extract-pile` | `format: shared-residual-sequence-shards-v2` | `*.pt`（`activations: [n, T, d]`, `valid_lengths`） | `[burn_in_tokens, valid_length)`（`data.skip_burn_in`） |
+
+LeJEPA-SAEのshardはmemory mapで必要な行だけ読みます（`safetensors` パッケージは不要）。
+LeJEPA-SAEのmanifestは文書単位のtrain / validation / testを持つので、そのsplitをそのまま使います。
 
 - train: manifestの `train` shard。**正規化統計はtrainからのみ計算**します。
-- validation / test: manifestに `test` があればそれを、なければ `validation` shardの後半半分をtestとして予約します（`data.test_split=auto`, `holdout_test_fraction=0.5`）。validation shardが1個しかない場合は、そのshard内で**系列単位**に分割します（`path#rows=start:stop`）。分割できない場合（系列が1本など）は学習前にエラーで停止します。shard・系列範囲の重複もエラーになります。
+- validation / test: manifestに `test` があればそれを（LeJEPA-SAE形式は通常こちら）、なければ `validation` shardの後半半分をtestとして予約します（`data.test_split=auto`, `holdout_test_fraction=0.5`）。validation shardが1個しかない場合は、そのshard内で**系列単位**に分割します（`path#rows=start:stop`）。分割できない場合（系列が1本など）は学習前にエラーで停止します。shard・系列範囲の重複もエラーになります。
 - 学習開始時に `eval.required_splits`（既定 `[validation, test]`、sweepでは `EVAL_SPLITS` から設定）の各splitが空でなく、評価バッチを1つ以上作れることを確認します。validationだけで評価する場合は `data.test_split=none` と `eval.required_splits=[validation]`（sweepでは `EVAL_SPLITS=validation`）を指定してください。
 
 ## 実行
@@ -64,7 +71,7 @@ JEPA-SAEの `sr-extract-pile` で作成した `manifest.json`（`shared-residual
 ### Pilot sweep（Dense-AE と Dense-SIGReg-AE）
 
 ```bash
-ACTIVATION_MANIFEST=runs/shared-data/pile-activations/manifest.json \
+ACTIVATION_MANIFEST=../LeJEPA-SAE/data/the-pile/pythia-6.9b/layer-16-ctx1024-100m/manifest.json \
 RUN_ROOT=runs/stage1-pilot \
 WEIGHTS="0 0.01 0.1 1" SEED=42 STEPS=10000 \
 bash scripts/stage1_sweep.sh

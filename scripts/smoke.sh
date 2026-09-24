@@ -6,7 +6,9 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 SMOKE_DIR="${SMOKE_DIR:-runs/smoke}"
 
-sj-make-synthetic --output-dir "$SMOKE_DIR/data" --d-in 64 --train-shards 8 --validation-shards 4
+LAYOUT="${LAYOUT:-jepa-sae}"  # jepa-sae or lejepa-sae
+sj-make-synthetic --output-dir "$SMOKE_DIR/data" --d-in 64 --train-shards 8 --validation-shards 4 \
+  --layout "$LAYOUT"
 ACTIVATION_MANIFEST="$SMOKE_DIR/data/manifest.json" \
 RUN_ROOT="$SMOKE_DIR/runs" \
 WEIGHTS="0 0.1" STEPS=60 DEVICE=cpu \

@@ -1,9 +1,17 @@
-"""Reading residual activations produced by JEPA-SAE's ``sr-extract-pile``.
+"""Reading residual activations from two extraction layouts.
 
-The on-disk format is ``shared-residual-sequence-shards-v2``: each shard is a
-``torch.save`` dict with ``activations`` of shape ``[n, sequence_length, d_in]``
-and ``valid_lengths`` of shape ``[n]``.  Stage 1 treats every valid token
-position (optionally after the burn-in prefix) as one independent sample.
+* JEPA-SAE ``sr-extract-pile`` (``format = shared-residual-sequence-shards-v2``):
+  each shard is a ``torch.save`` dict with ``activations`` of shape
+  ``[n, sequence_length, d_in]`` and ``valid_lengths`` of shape ``[n]``; the
+  manifest lists train / validation shards and a burn-in prefix.
+* LeJEPA-SAE ``extract`` (``format_version = 1``): each shard is a safetensors
+  file with flat ``activations`` of shape ``[num_tokens, d_llm]``; the manifest
+  lists every shard with its document-level ``split`` and the ``offset`` /
+  ``length`` of each sequence inside it.  There is no burn-in prefix.
+
+Both are mapped onto one internal view in which a split is a list of shard
+entries and each entry is a list of sequences.  Stage 1 treats every usable
+token position as one independent sample.
 """
 
 from __future__ import annotations
@@ -12,12 +20,14 @@ import hashlib
 import json
 import math
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
+import numpy as np
 import torch
 
 
 ACTIVATION_FORMAT = "shared-residual-sequence-shards-v2"
+LEJEPA_FORMAT = "lejepa-sae-safetensors-v1"
 SPLITS = ("train", "validation", "test")
 
 
@@ -45,7 +55,13 @@ def load_activation_manifest(path: str | Path) -> tuple[Path, dict[str, Any]]:
         manifest_path = manifest_path / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if manifest.get("format") != ACTIVATION_FORMAT:
-        raise ValueError(f"unsupported activation manifest format at {manifest_path}")
+        if not _is_lejepa_manifest(manifest):
+            raise ValueError(
+                f"unsupported activation manifest at {manifest_path}: expected JEPA-SAE "
+                f"(format={ACTIVATION_FORMAT!r}) or LeJEPA-SAE (format_version=1 with "
+                "'d_llm' and 'shards') layout"
+            )
+        manifest = _canonical_lejepa_manifest(manifest)
     for key in ("d_in", "sequence_length", "train", "validation"):
         if key not in manifest:
             raise ValueError(f"activation manifest is missing {key!r}")
@@ -53,6 +69,77 @@ def load_activation_manifest(path: str | Path) -> tuple[Path, dict[str, Any]]:
         if not manifest[split].get("shards"):
             raise ValueError(f"activation manifest has no {split} shards")
     return manifest_path.parent, manifest
+
+
+def _is_lejepa_manifest(manifest: dict[str, Any]) -> bool:
+    return (
+        manifest.get("format_version") == 1
+        and "d_llm" in manifest
+        and isinstance(manifest.get("shards"), list)
+    )
+
+
+def _canonical_lejepa_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
+    """Map a LeJEPA-SAE manifest onto the internal split / shard view."""
+    canonical: dict[str, Any] = {
+        "format": LEJEPA_FORMAT,
+        "dataset": {
+            key: manifest.get(key)
+            for key in ("dataset", "dataset_config", "dataset_revision", "data_files",
+                        "source_split", "split_unit", "validation_fraction", "test_fraction")
+        },
+        "model": manifest.get("model"),
+        "resolved_model_revision": manifest.get("revision"),
+        "layer": manifest.get("layer"),
+        "hook_point": manifest.get("hook_point"),
+        "sequence_length": int(manifest.get("context_length", 0)),
+        "burn_in_tokens": 0,
+        "d_in": int(manifest["d_llm"]),
+        "storage_dtype": manifest.get("dtype"),
+        "seed": manifest.get("split_seed"),
+        "sequence_tables": {},
+    }
+    for split in SPLITS:
+        canonical[split] = {"shards": [], "sequences": 0, "positions": 0}
+    for shard in manifest["shards"]:
+        split = shard["split"]
+        if split not in SPLITS:
+            raise ValueError(f"unknown split {split!r} for shard {shard['file']}")
+        table = [[int(s["offset"]), int(s["length"])] for s in shard["sequences"]]
+        canonical["sequence_tables"][shard["file"]] = table
+        canonical[split]["shards"].append(shard["file"])
+        canonical[split]["sequences"] += len(table)
+        canonical[split]["positions"] += int(shard.get("num_tokens", sum(n for _, n in table)))
+    return canonical
+
+
+def _safetensors_array(path: Path, name: str = "activations") -> tuple[np.memmap, str]:
+    """Memory-map one tensor of a safetensors file without reading it."""
+    with path.open("rb") as f:
+        header_size = int.from_bytes(f.read(8), "little")
+        header = json.loads(f.read(header_size))
+    if name not in header:
+        raise ValueError(f"{path} has no tensor {name!r}")
+    info = header[name]
+    dtypes = {"BF16": np.uint16, "F16": np.float16, "F32": np.float32}
+    if info["dtype"] not in dtypes:
+        raise ValueError(f"unsupported safetensors dtype {info['dtype']} in {path}")
+    begin = info["data_offsets"][0]
+    array = np.memmap(
+        path,
+        dtype=dtypes[info["dtype"]],
+        mode="r",
+        offset=8 + header_size + begin,
+        shape=tuple(info["shape"]),
+    )
+    return array, info["dtype"]
+
+
+def read_safetensors_rows(path: Path, rows: torch.Tensor) -> torch.Tensor:
+    """Selected rows of a flat ``[num_tokens, d]`` safetensors ``activations`` tensor."""
+    array, dtype = _safetensors_array(path)
+    values = torch.from_numpy(np.ascontiguousarray(array[rows.numpy()]))
+    return values.view(torch.bfloat16) if dtype == "BF16" else values
 
 
 def manifest_fingerprint(manifest: dict[str, Any]) -> str:
@@ -99,7 +186,7 @@ def resolve_splits(
     manifest: dict[str, Any],
     test_split: str = "auto",
     holdout_test_fraction: float = 0.5,
-    root: Path | None = None,
+    sequence_count: Callable[[str], int] | None = None,
 ) -> dict[str, list[str]]:
     """Return split entries for train / validation / test.
 
@@ -138,10 +225,10 @@ def resolve_splits(
             test = validation[len(validation) - n_test :]
             validation = validation[: len(validation) - n_test]
         else:
-            if root is None:
-                raise ValueError("a sequence-level holdout needs the manifest root")
+            if sequence_count is None:
+                raise ValueError("a sequence-level holdout needs a sequence counter")
             (only,) = validation
-            sequences = len(load_valid_lengths(root / only))
+            sequences = sequence_count(only)
             if sequences < 2:
                 raise ValueError(
                     "cannot hold out a test split: the only validation shard has "
@@ -226,11 +313,44 @@ class DataSource:
         self.sequence_length = int(self.manifest["sequence_length"])
         self.d_in = int(self.manifest["d_in"])
         self.burn_in = int(self.manifest.get("burn_in_tokens", 0)) if skip_burn_in else 0
+        self.format = self.manifest["format"]
+        self._counts: dict[str, torch.Tensor] = {}
+        self._tables: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
         self.splits = resolve_splits(
-            self.manifest, test_split, holdout_test_fraction, self.root
+            self.manifest,
+            test_split,
+            holdout_test_fraction,
+            lambda path: len(self._sequence_table(path)[1]),
         )
         self.fingerprint = manifest_fingerprint(self.manifest)
-        self._counts: dict[str, torch.Tensor] = {}
+
+    def _sequence_table(self, path: str) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(start, length)`` of every sequence in a shard file.
+
+        JEPA-SAE: ``start`` is the row of the ``[n, T, d]`` tensor.
+        LeJEPA-SAE: ``start`` is the token offset into the flat ``[N, d]`` tensor.
+        """
+        if path not in self._tables:
+            if self.format == LEJEPA_FORMAT:
+                table = torch.tensor(
+                    self.manifest["sequence_tables"][path], dtype=torch.long
+                ).reshape(-1, 2)
+                self._tables[path] = (table[:, 0], table[:, 1])
+            else:
+                lengths = load_valid_lengths(self.root / path)
+                self._tables[path] = (torch.arange(len(lengths)), lengths)
+        return self._tables[path]
+
+    def _flat_rows(self, entry: str, local: torch.Tensor | None) -> torch.Tensor:
+        """LeJEPA-SAE token indices of usable positions (all of them, or ``local``)."""
+        path, start, stop = parse_entry(entry)
+        offsets = self._sequence_table(path)[0][start:stop]
+        counts = self.sequence_counts(entry)
+        ends = counts.cumsum(0)
+        if local is None:
+            local = torch.arange(int(ends[-1]) if len(ends) else 0)
+        sequence = torch.searchsorted(ends, local, right=True)
+        return offsets[sequence] + self.burn_in + local - (ends - counts)[sequence]
 
     def paths(self, split: str) -> list[str]:
         """Split entries: shard paths, optionally with a sequence-row range."""
@@ -242,16 +362,18 @@ class DataSource:
 
     def positions(self, entry: str) -> torch.Tensor:
         """All valid positions of an entry as ``[n, d]`` in storage order."""
+        if self.format == LEJEPA_FORMAT:
+            return read_safetensors_rows(self._resolve(entry)[0], self._flat_rows(entry, None))
         path, start, stop = self._resolve(entry)
         activations, valid_lengths = load_sequence_shard(path, self.sequence_length)
         activations, valid_lengths = activations[start:stop], valid_lengths[start:stop]
         return activations[_position_mask(valid_lengths, self.sequence_length, self.burn_in)]
 
     def sequence_counts(self, entry: str) -> torch.Tensor:
-        """Usable positions per sequence of an entry (cached; memory-mapped read)."""
+        """Usable positions per sequence of an entry (cached)."""
         if entry not in self._counts:
-            path, start, stop = self._resolve(entry)
-            lengths = load_valid_lengths(path)[start:stop]
+            path, start, stop = parse_entry(entry)
+            lengths = self._sequence_table(path)[1][start:stop]
             self._counts[entry] = (lengths - self.burn_in).clamp_min(0)
         return self._counts[entry]
 
@@ -260,6 +382,8 @@ class DataSource:
 
     def gather(self, entry: str, local: torch.Tensor) -> torch.Tensor:
         """Rows ``local`` (indices in :meth:`positions` order) read via a memory map."""
+        if self.format == LEJEPA_FORMAT:
+            return read_safetensors_rows(self._resolve(entry)[0], self._flat_rows(entry, local))
         path, start, _ = self._resolve(entry)
         counts = self.sequence_counts(entry)
         ends = counts.cumsum(0)
