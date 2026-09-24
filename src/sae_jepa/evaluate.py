@@ -226,7 +226,9 @@ def evaluate_model(
     sum_h = torch.zeros(d_in, dtype=torch.float64, device=device)
     sum_h_sq = 0.0
     batches = 0
-    for batch in eval_batches(source, split, batch_size, maximum_batches):
+    for batch in eval_batches(
+        source, split, batch_size, maximum_batches, seed=eval_cfg.sample_seed
+    ):
         h = batch.to(device).float()
         with _autocast(device, amp_dtype):
             out = model(h)

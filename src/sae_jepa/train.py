@@ -67,6 +67,48 @@ def lr_multiplier(completed_steps: int, total_steps: int, warmup_steps: int, dec
     return min(warm, decay)
 
 
+# Settings that may change between a checkpoint and its resumption: they only
+# affect logging cadence, file locations, hardware, or offline evaluation.
+# The manifest and normalization paths are compared by content instead.
+RESUMABLE_KEYS = {
+    "name",
+    "data.activation_manifest",
+    "data.normalization_path",
+    "train.output_dir",
+    "train.device",
+    "train.log_every",
+    "train.validation_every",
+    "train.validation_batches",
+    "train.checkpoint_every",
+    "train.keep_checkpoints",
+}
+RESUMABLE_SECTIONS = {"eval"}
+
+
+def _flatten(values: dict[str, Any], prefix: str = "") -> dict[str, Any]:
+    flat: dict[str, Any] = {}
+    for key, value in values.items():
+        name = f"{prefix}{key}"
+        if isinstance(value, dict):
+            flat.update(_flatten(value, f"{name}."))
+        else:
+            flat[name] = list(value) if isinstance(value, tuple) else value
+    return flat
+
+
+def training_config_differences(saved: dict[str, Any], current: ExperimentConfig) -> list[str]:
+    """Every training-relevant setting whose value differs from the checkpoint."""
+    old = _flatten(saved)
+    new = _flatten(config_to_dict(current))
+    differences = []
+    for key in sorted(set(old) | set(new)):
+        if key in RESUMABLE_KEYS or key.split(".", 1)[0] in RESUMABLE_SECTIONS:
+            continue
+        if old.get(key, "<missing>") != new.get(key, "<missing>"):
+            differences.append(f"{key}: {old.get(key, '<missing>')!r} -> {new.get(key, '<missing>')!r}")
+    return differences
+
+
 def rms(value: torch.Tensor) -> float:
     return float(value.detach().float().square().mean().sqrt())
 
@@ -90,6 +132,7 @@ class Trainer:
             test_split=cfg.data.test_split,
             holdout_test_fraction=cfg.data.holdout_test_fraction,
         )
+        self._check_required_splits()
         if cfg.model.d_in == 0:
             cfg.model.d_in = self.source.d_in
         elif cfg.model.d_in != self.source.d_in:
@@ -144,6 +187,24 @@ class Trainer:
         )
 
     # ------------------------------------------------------------------ setup
+    def _check_required_splits(self) -> None:
+        """Fail before training if a split that will be evaluated is unusable."""
+        for split in self.cfg.eval.required_splits:
+            if split not in ("validation", "test"):
+                raise ValueError(f"eval.required_splits: unknown held-out split {split!r}")
+            if not self.source.splits[split]:
+                raise ValueError(
+                    f"required split {split!r} is empty (data.test_split="
+                    f"{self.cfg.data.test_split!r}); provide it or drop it from "
+                    "eval.required_splits"
+                )
+            positions = self.source.split_positions(split)
+            if positions < self.cfg.eval.batch_size:
+                raise ValueError(
+                    f"required split {split!r} has {positions} positions, fewer than "
+                    f"one evaluation batch of {self.cfg.eval.batch_size}"
+                )
+
     def _load_or_compute_normalization(self) -> dict[str, Any]:
         path = self.cfg.data.normalization_path
         if path:
@@ -245,19 +306,20 @@ class Trainer:
             raise ValueError(f"unsupported checkpoint {path}")
         if state["data_manifest"]["fingerprint"] != self.source.fingerprint:
             raise ValueError("checkpoint was trained on a different activation manifest")
-        saved = state["config"]
-        for section, keys in {
-            "model": ("type", "d_hidden", "d_latent", "activation"),
-            "optim": ("batch_size", "steps", "lr", "warmup_steps", "decay_fraction"),
-            "sigreg": ("weight", "num_projections", "num_points", "t_min", "t_max"),
-            "train": ("seed",),
-        }.items():
-            for key in keys:
-                current = getattr(getattr(self.cfg, section), key)
-                if saved[section][key] != current and not (
-                    isinstance(current, tuple) and list(current) == saved[section][key]
-                ):
-                    raise ValueError(f"cannot resume: {section}.{key} changed")
+        differences = training_config_differences(state["config"], self.cfg)
+        if differences:
+            raise ValueError(
+                "cannot resume: settings that change training differ from the "
+                "checkpoint (start a new run instead): " + "; ".join(differences)
+            )
+        if state["data_manifest"]["splits"] != self.source.splits:
+            raise ValueError("cannot resume: split assignment differs from the checkpoint")
+        saved_norm = state["normalization"]
+        if not (
+            torch.equal(saved_norm["mean"], self.normalization["mean"])
+            and saved_norm["scale"] == self.normalization["scale"]
+        ):
+            raise ValueError("cannot resume: normalization statistics differ from the checkpoint")
         self.model.load_state_dict(state["model"])
         self.optimizer.load_state_dict(state["optimizer"])
         self.scheduler.load_state_dict(state["scheduler"])

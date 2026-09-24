@@ -56,7 +56,8 @@ JEPA-SAEの `sr-extract-pile` で作成した `manifest.json`（`shared-residual
 各系列の `[burn_in_tokens, valid_length)` の位置を独立サンプルとして扱います（`data.skip_burn_in`）。
 
 - train: manifestの `train` shard。**正規化統計はtrainからのみ計算**します。
-- validation / test: manifestに `test` があればそれを、なければ `validation` shardの後半半分をtestとして予約します（`data.test_split=auto`, `holdout_test_fraction=0.5`）。shardの重複はエラーになります。
+- validation / test: manifestに `test` があればそれを、なければ `validation` shardの後半半分をtestとして予約します（`data.test_split=auto`, `holdout_test_fraction=0.5`）。validation shardが1個しかない場合は、そのshard内で**系列単位**に分割します（`path#rows=start:stop`）。分割できない場合（系列が1本など）は学習前にエラーで停止します。shard・系列範囲の重複もエラーになります。
+- 学習開始時に `eval.required_splits`（既定 `[validation, test]`、sweepでは `EVAL_SPLITS` から設定）の各splitが空でなく、評価バッチを1つ以上作れることを確認します。validationだけで評価する場合は `data.test_split=none` と `eval.required_splits=[validation]`（sweepでは `EVAL_SPLITS=validation`）を指定してください。
 
 ## 実行
 
@@ -91,6 +92,7 @@ sj-fit-pca --activation-manifest MANIFEST --normalization runs/x/normalization.p
 ```
 
 `sj-train-dense` は `--resume auto`（既定）で `OUTPUT/checkpoints/latest.pt` から再開します。
+再開時は、ログ間隔・checkpoint間隔・出力先・device・`eval.*` 以外のすべての設定（model / sigreg / optim / data / seed）をcheckpointと比較し、1つでも異なれば停止します（例：`optim.weight_decay`、`sigreg.scale_by_batch_size`）。split割り当てと正規化統計の一致も確認します。設定を変える場合は新しいrunとして学習してください。
 
 ### CPUスモークテスト
 
@@ -126,6 +128,8 @@ checkpoint評価（`eval-{split}-step-*.json`）:
 | Gaussian化 | held-out SIGReg（固定validation射影）、`mean_sq_per_dim`、分散、`cov_fro_dev = ‖Cov(y)−I‖_F/√d`、固有値スペクトル・有効ランク |
 | 診断 | 学習に使わない射影上の W₂²・SIGReg・分位点のずれ |
 
+**評価バッチ**：同じ文書内の連続トークンは強く相関するため、保存順のバッチでは各トークンの分布がGaussianでもバッチ単位のSIGRegが大きく出ます。そこで評価専用の固定seed（`eval.sample_seed`）で**split全体（全shard・全系列）から** `eval.batches × eval.batch_size` 個の位置を非復元抽出し、ランダムな順序でバッチに割り当てます（`eval.batches=0` なら全フルバッチ）。抽出はデータとseedだけで決まるため、全λ・全checkpointが同一のバッチで評価されます。読み込みはmemory mapで行い、必要な行だけを読みます。
+
 すべてのGaussian化指標に、**同じバッチ数・バッチサイズ・射影数の厳密なGaussianサンプルでの参照値**（`reference/...`）を併記します。
 dead featureや「正なら発火」などの疎モデル用指標は密モデルには適用しません。
 
@@ -146,6 +150,10 @@ dead featureや「正なら発火」などの疎モデル用指標は密モデ�
 - 条件間で初期重みとデータ順序が一致する
 - checkpoint再開でデータ順序・射影乱数・学習率が継続し、中断なしの学習とパラメータが一致する
 - validationがtrain側の乱数状態を変更しない
+- 評価バッチがsplit全体から固定seedで抽出され、重複なく複数shardを混ぜ、呼び出しごとに同一になる
+- 系列内で強く相関する（周辺は標準Gaussianの）データで、保存順バッチのSIGRegは参照値より大きく、シャッフル評価では参照値近くになる
+- validation shardが1個なら系列単位で分割し、分割不能・必須splitが空なら学習前に停止する
+- 学習に影響する設定を変えた再開を拒否し、ログ・評価設定の変更は許可する
 
 ## 構成
 

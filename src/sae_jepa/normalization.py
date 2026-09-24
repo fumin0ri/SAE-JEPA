@@ -19,7 +19,7 @@ from typing import Any
 import torch
 from tqdm import tqdm
 
-from .data import DataSource, torch_load
+from .data import DataSource, parse_entry, torch_load
 
 
 NORMALIZATION_FORMAT = "sae-jepa-normalization-v1"
@@ -94,8 +94,10 @@ def check_normalization_matches(stats: dict[str, Any], source: DataSource) -> No
         raise ValueError("normalization was computed for a different activation manifest")
     if list(stats["shards"]) != list(source.splits["train"]):
         raise ValueError("normalization shards differ from the train split")
-    held_out = set(source.splits["validation"]) | set(source.splits["test"])
-    if held_out & set(stats["shards"]):
+    held_out = {
+        parse_entry(entry)[0] for entry in source.splits["validation"] + source.splits["test"]
+    }
+    if held_out & {parse_entry(entry)[0] for entry in stats["shards"]}:
         raise ValueError("normalization statistics include held-out shards")
     if int(stats["burn_in_excluded"]) != source.burn_in:
         raise ValueError("normalization used a different burn-in policy")

@@ -15,6 +15,9 @@ STEPS="${STEPS:-10000}"
 DEVICE="${DEVICE:-cuda}"
 EVAL_SPLITS="${EVAL_SPLITS:-validation test}"
 EXTRA_ARGS=(${EXTRA_ARGS:-})
+# Every split evaluated below must exist before any training starts; the
+# trainer checks eval.required_splits at startup and stops otherwise.
+REQUIRED_SPLITS="[$(echo $EVAL_SPLITS | tr ' ' ',')]"
 
 mkdir -p "$RUN_ROOT"
 git rev-parse HEAD > "$RUN_ROOT/code-commit.txt" 2>/dev/null || true
@@ -39,7 +42,7 @@ for weight in $WEIGHTS; do
     --set "optim.steps=$STEPS" \
     --set "train.seed=$SEED" \
     --set "train.device=$DEVICE" \
-    --set "train.output_dir=$run_dir" \
+    --set "train.output_dir=$run_dir"     --set "eval.required_splits=$REQUIRED_SPLITS" \
     "${EXTRA_ARGS[@]}"
   for split in $EVAL_SPLITS; do
     sj-evaluate-dense --checkpoint "$run_dir/checkpoints/latest.pt" --split "$split" --device "$DEVICE"

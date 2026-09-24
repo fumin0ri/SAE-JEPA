@@ -76,7 +76,13 @@ class TrainConfig:
 class EvalConfig:
     split: str = "validation"
     batch_size: int = 512  # same N as training so SIGReg values are comparable
-    batches: int = 64
+    # Evaluation batches are a fixed random sample of positions drawn from the
+    # whole split (all sequences and shards) and shuffled into batches with
+    # sample_seed, so every run and every lambda sees identical batches.
+    batches: int = 64  # 0 = every full batch of the split
+    sample_seed: int = 31_337
+    # Splits that must be non-empty before training starts (the sweep evaluates them).
+    required_splits: tuple[str, ...] = ("validation", "test")
     # Diagnostic projections are never used by training or validation SIGReg.
     diagnostic_projections: int = 256
     diagnostic_seed: int = 777

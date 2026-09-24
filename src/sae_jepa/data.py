@@ -82,17 +82,37 @@ def manifest_fingerprint(manifest: dict[str, Any]) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+def parse_entry(entry: str) -> tuple[str, int, int | None]:
+    """Split entry ``"path"`` or ``"path#rows=start:stop"`` (sequence rows)."""
+    path, marker, rows = entry.partition("#rows=")
+    if not marker:
+        return path, 0, None
+    start, stop = rows.split(":")
+    return path, int(start), int(stop)
+
+
+def format_entry(path: str, start: int, stop: int) -> str:
+    return f"{path}#rows={start}:{stop}"
+
+
 def resolve_splits(
-    manifest: dict[str, Any], test_split: str = "auto", holdout_test_fraction: float = 0.5
+    manifest: dict[str, Any],
+    test_split: str = "auto",
+    holdout_test_fraction: float = 0.5,
+    root: Path | None = None,
 ) -> dict[str, list[str]]:
-    """Return relative shard paths for train / validation / test.
+    """Return split entries for train / validation / test.
 
     ``test_split``:
       * ``"manifest"`` -- use ``manifest["test"]`` (error if absent);
       * ``"holdout"`` -- reserve the trailing ``holdout_test_fraction`` of the
-        validation shards as test shards;
+        validation shards as test shards.  With a single validation shard the
+        split is made at the sequence level inside that shard (entries of the
+        form ``path#rows=start:stop``);
       * ``"auto"`` -- ``manifest`` when present, otherwise ``holdout``;
       * ``"none"`` -- no test split.
+    A holdout that cannot produce non-empty validation and test splits raises
+    here, before any training, instead of failing at test evaluation.
     Train shards are never modified, so normalization statistics computed from
     the train split cannot depend on validation or test data.
     """
@@ -112,27 +132,60 @@ def resolve_splits(
     elif mode == "holdout":
         if not 0.0 < holdout_test_fraction < 1.0:
             raise ValueError("holdout_test_fraction must lie in (0, 1)")
-        n_test = math.floor(len(validation) * holdout_test_fraction)
-        if n_test >= 1 and len(validation) - n_test >= 1:
+        if len(validation) >= 2:
+            n_test = round(len(validation) * holdout_test_fraction)
+            n_test = min(len(validation) - 1, max(1, n_test))
             test = validation[len(validation) - n_test :]
             validation = validation[: len(validation) - n_test]
+        else:
+            if root is None:
+                raise ValueError("a sequence-level holdout needs the manifest root")
+            (only,) = validation
+            sequences = len(load_valid_lengths(root / only))
+            if sequences < 2:
+                raise ValueError(
+                    "cannot hold out a test split: the only validation shard has "
+                    f"{sequences} sequence(s); extract more validation data or set "
+                    "data.test_split=none and evaluate on validation only"
+                )
+            n_test = min(sequences - 1, max(1, round(sequences * holdout_test_fraction)))
+            validation = [format_entry(only, 0, sequences - n_test)]
+            test = [format_entry(only, sequences - n_test, sequences)]
     splits = {"train": train, "validation": validation, "test": test}
     assert_disjoint_splits(splits)
     return splits
 
 
 def assert_disjoint_splits(splits: dict[str, list[str]]) -> None:
-    seen: dict[str, str] = {}
-    for split, paths in splits.items():
-        for path in paths:
-            key = str(Path(path).as_posix())
-            if key in seen and seen[key] != split:
-                raise ValueError(f"shard {path} appears in both {seen[key]} and {split}")
-            seen[key] = split
+    claimed: dict[str, list[tuple[str, int, float]]] = {}
+    for split, entries in splits.items():
+        for entry in entries:
+            path, start, stop = parse_entry(entry)
+            key = Path(path).as_posix()
+            end = math.inf if stop is None else stop
+            for other_split, other_start, other_end in claimed.get(key, []):
+                if start < other_end and other_start < end:
+                    raise ValueError(f"{entry} overlaps data already assigned to {other_split}")
+            claimed.setdefault(key, []).append((split, start, end))
 
 
-def load_sequence_shard(path: Path, sequence_length: int) -> tuple[torch.Tensor, torch.Tensor]:
-    value = torch_load(path)
+def _load(path: Path, mmap: bool) -> Any:
+    if mmap:
+        try:
+            return torch.load(path, map_location="cpu", weights_only=False, mmap=True)
+        except (RuntimeError, ValueError):
+            pass  # legacy (non-zip) serialization cannot be memory-mapped
+    return torch_load(path)
+
+
+def load_valid_lengths(path: Path) -> torch.Tensor:
+    return _load(path, mmap=True)["valid_lengths"].long().clone()
+
+
+def load_sequence_shard(
+    path: Path, sequence_length: int, mmap: bool = False
+) -> tuple[torch.Tensor, torch.Tensor]:
+    value = _load(path, mmap)
     if not isinstance(value, dict) or "activations" not in value:
         raise ValueError(f"invalid sequence shard at {path}")
     activations = value["activations"]
@@ -149,9 +202,12 @@ def shard_positions(
 ) -> torch.Tensor:
     """All valid positions ``[burn_in, valid_length)`` of a shard as ``[n, d]``."""
     activations, valid_lengths = load_sequence_shard(path, sequence_length)
+    return activations[_position_mask(valid_lengths, sequence_length, burn_in)]
+
+
+def _position_mask(valid_lengths: torch.Tensor, sequence_length: int, burn_in: int) -> torch.Tensor:
     positions = torch.arange(sequence_length)
-    mask = (positions[None, :] >= burn_in) & (positions[None, :] < valid_lengths[:, None])
-    return activations[mask]
+    return (positions[None, :] >= burn_in) & (positions[None, :] < valid_lengths[:, None])
 
 
 class DataSource:
@@ -170,14 +226,47 @@ class DataSource:
         self.sequence_length = int(self.manifest["sequence_length"])
         self.d_in = int(self.manifest["d_in"])
         self.burn_in = int(self.manifest.get("burn_in_tokens", 0)) if skip_burn_in else 0
-        self.splits = resolve_splits(self.manifest, test_split, holdout_test_fraction)
+        self.splits = resolve_splits(
+            self.manifest, test_split, holdout_test_fraction, self.root
+        )
         self.fingerprint = manifest_fingerprint(self.manifest)
+        self._counts: dict[str, torch.Tensor] = {}
 
-    def paths(self, split: str) -> list[Path]:
-        return [self.root / relative for relative in self.splits[split]]
+    def paths(self, split: str) -> list[str]:
+        """Split entries: shard paths, optionally with a sequence-row range."""
+        return list(self.splits[split])
 
-    def positions(self, path: Path) -> torch.Tensor:
-        return shard_positions(path, self.sequence_length, self.burn_in)
+    def _resolve(self, entry: str) -> tuple[Path, int, int | None]:
+        path, start, stop = parse_entry(entry)
+        return self.root / path, start, stop
+
+    def positions(self, entry: str) -> torch.Tensor:
+        """All valid positions of an entry as ``[n, d]`` in storage order."""
+        path, start, stop = self._resolve(entry)
+        activations, valid_lengths = load_sequence_shard(path, self.sequence_length)
+        activations, valid_lengths = activations[start:stop], valid_lengths[start:stop]
+        return activations[_position_mask(valid_lengths, self.sequence_length, self.burn_in)]
+
+    def sequence_counts(self, entry: str) -> torch.Tensor:
+        """Usable positions per sequence of an entry (cached; memory-mapped read)."""
+        if entry not in self._counts:
+            path, start, stop = self._resolve(entry)
+            lengths = load_valid_lengths(path)[start:stop]
+            self._counts[entry] = (lengths - self.burn_in).clamp_min(0)
+        return self._counts[entry]
+
+    def split_positions(self, split: str) -> int:
+        return sum(int(self.sequence_counts(entry).sum()) for entry in self.paths(split))
+
+    def gather(self, entry: str, local: torch.Tensor) -> torch.Tensor:
+        """Rows ``local`` (indices in :meth:`positions` order) read via a memory map."""
+        path, start, _ = self._resolve(entry)
+        counts = self.sequence_counts(entry)
+        ends = counts.cumsum(0)
+        sequence = torch.searchsorted(ends, local, right=True)
+        position = self.burn_in + local - (ends - counts)[sequence]
+        activations, _ = load_sequence_shard(path, self.sequence_length, mmap=True)
+        return activations[sequence + start, position].clone()
 
     def record(self) -> dict[str, Any]:
         """Data manifest record stored with checkpoints and reports."""
@@ -299,28 +388,53 @@ class TrainBatches:
 
 
 def eval_batches(
-    source: DataSource, split: str, batch_size: int, maximum_batches: int = 0
+    source: DataSource,
+    split: str,
+    batch_size: int,
+    maximum_batches: int = 0,
+    seed: int = 0,
+    chunk_batches: int = 16,
 ) -> Iterator[torch.Tensor]:
-    """Deterministic full batches of held-out positions in storage order.
+    """Fixed, shuffled evaluation batches drawn from the whole held-out split.
 
-    A trailing partial batch is dropped so that every batch has the same ``N``;
-    the N-scaled SIGReg statistic is only comparable at a fixed batch size.
+    Consecutive tokens of one document are strongly correlated, so storage-order
+    batches make even a per-token Gaussian look non-Gaussian to the batch-level
+    SIGReg statistic.  Instead a generator seeded only by ``seed`` draws
+    ``maximum_batches * batch_size`` positions without replacement from all
+    sequences and shards of the split (every full batch when ``maximum_batches``
+    is 0) and assigns them to batches in random order.  The sample depends only
+    on (data, split, batch_size, maximum_batches, seed), so every model and every
+    lambda sees identical batches.  All batches have the same ``N`` because the
+    N-scaled SIGReg statistic is only comparable at a fixed batch size.  Rows
+    are read through memory maps in chunks of ``chunk_batches`` batches.
     """
     if split == "train":
         raise ValueError("evaluation batches are only drawn from held-out splits")
-    if not source.splits.get(split):
+    entries = source.paths(split)
+    if not entries:
         raise ValueError(f"split {split!r} has no shards")
-    emitted = 0
-    pending: torch.Tensor | None = None
-    for path in source.paths(split):
-        rows = source.positions(path)
-        if pending is not None and len(pending):
-            rows = torch.cat([pending, rows])
-        start = 0
-        while start + batch_size <= len(rows):
-            yield rows[start : start + batch_size]
-            emitted += 1
-            start += batch_size
-            if maximum_batches > 0 and emitted >= maximum_batches:
-                return
-        pending = rows[start:]
+    counts = torch.tensor([int(source.sequence_counts(entry).sum()) for entry in entries])
+    total = int(counts.sum())
+    n_batches = total // batch_size
+    if maximum_batches > 0:
+        n_batches = min(n_batches, maximum_batches)
+    if n_batches == 0:
+        return
+    order = torch.randperm(total, generator=torch.Generator().manual_seed(seed))
+    order = order[: n_batches * batch_size]
+    ends = counts.cumsum(0)
+    starts = ends - counts
+    step = max(1, chunk_batches) * batch_size
+    for chunk_start in range(0, len(order), step):
+        slots = order[chunk_start : chunk_start + step]
+        owner = torch.searchsorted(ends, slots, right=True)
+        buffer: torch.Tensor | None = None
+        for index in torch.unique(owner).tolist():
+            mask = owner == index
+            rows = source.gather(entries[index], slots[mask] - starts[index])
+            if buffer is None:
+                buffer = torch.empty(len(slots), rows.shape[-1], dtype=rows.dtype)
+            buffer[mask] = rows
+        assert buffer is not None
+        for offset in range(0, len(slots), batch_size):
+            yield buffer[offset : offset + batch_size]
