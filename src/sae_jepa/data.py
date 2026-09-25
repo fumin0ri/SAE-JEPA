@@ -305,14 +305,26 @@ class DataSource:
         manifest_path: str | Path,
         *,
         skip_burn_in: bool = True,
+        skip_leading_positions: int = 0,
         test_split: str = "auto",
         holdout_test_fraction: float = 0.5,
     ):
+        """``skip_leading_positions`` drops token positions ``< k`` of every stored
+        sequence (position 0 = first token of each forward pass, e.g. the
+        attention-sink token of each LeJEPA-SAE ``context_length`` segment).
+        Combined with the manifest burn-in, the usable positions of a sequence
+        are ``[max(burn_in, k), length)`` for normalization, training and
+        evaluation alike.
+        """
+        if skip_leading_positions < 0:
+            raise ValueError("skip_leading_positions cannot be negative")
         self.manifest_path = Path(manifest_path)
         self.root, self.manifest = load_activation_manifest(manifest_path)
         self.sequence_length = int(self.manifest["sequence_length"])
         self.d_in = int(self.manifest["d_in"])
-        self.burn_in = int(self.manifest.get("burn_in_tokens", 0)) if skip_burn_in else 0
+        manifest_burn_in = int(self.manifest.get("burn_in_tokens", 0)) if skip_burn_in else 0
+        self.skip_leading_positions = int(skip_leading_positions)
+        self.burn_in = max(manifest_burn_in, self.skip_leading_positions)
         self.format = self.manifest["format"]
         self._counts: dict[str, torch.Tensor] = {}
         self._tables: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
@@ -414,6 +426,7 @@ class DataSource:
             "d_in": self.d_in,
             "sequence_length": self.sequence_length,
             "burn_in_excluded": self.burn_in,
+            "skip_leading_positions": self.skip_leading_positions,
             "splits": {split: list(paths) for split, paths in self.splits.items()},
         }
 

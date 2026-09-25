@@ -519,6 +519,7 @@ def main() -> None:
     source = DataSource(
         args.activation_manifest or cfg.data.activation_manifest,
         skip_burn_in=cfg.data.skip_burn_in,
+        skip_leading_positions=cfg.data.skip_leading_positions,
         test_split=cfg.data.test_split,
         holdout_test_fraction=cfg.data.holdout_test_fraction,
     )

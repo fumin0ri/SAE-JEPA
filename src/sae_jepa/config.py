@@ -16,6 +16,10 @@ class DataConfig:
     # they are computed at startup and saved next to the run.
     normalization_path: str = ""
     skip_burn_in: bool = True
+    # Drop token positions < k of every stored sequence from normalization,
+    # training and evaluation (1 = drop the first token of each segment, whose
+    # residual norm is an extreme outlier in Pythia).  0 keeps every position.
+    skip_leading_positions: int = 0
     shards_per_window: int = 4
     test_split: str = "auto"
     holdout_test_fraction: float = 0.5
@@ -115,6 +119,8 @@ class ExperimentConfig:
             raise ValueError(f"unknown model.type {self.model.type!r}")
         if self.sigreg.weight < 0:
             raise ValueError("sigreg.weight must be non-negative")
+        if self.data.skip_leading_positions < 0:
+            raise ValueError("data.skip_leading_positions cannot be negative")
         if self.optim.batch_size < 2 or self.optim.steps < 1:
             raise ValueError("batch_size must be >= 2 and steps >= 1")
         if not 0.0 <= self.optim.decay_fraction <= 1.0:

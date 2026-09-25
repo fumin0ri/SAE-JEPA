@@ -52,6 +52,10 @@ class DenseCheckpointFrontend(nn.Module):
 
         self.model, state = load_checkpoint_model(checkpoint, torch.device("cpu"))
         self.sigreg_weight = float(state["config"]["sigreg"]["weight"])
+        # Positions the encoder never saw in training; stage 2 should drop them too.
+        self.skip_leading_positions = int(
+            state["config"]["data"].get("skip_leading_positions", 0)
+        )
         self.d_out = self.model.cfg.d_latent
 
     def encode_dense(self, h: torch.Tensor) -> torch.Tensor:

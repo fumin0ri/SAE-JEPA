@@ -20,7 +20,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from .config import ExperimentConfig, config_to_dict, load_config
+from .config import ExperimentConfig, config_from_dict, config_to_dict, load_config
 from .data import DataSource, TrainBatches, mix_seed, write_json
 from .evaluate import evaluate_model, write_evaluation
 from .models import ARCHITECTURE_ID, DenseSIGRegAE, build_model
@@ -97,8 +97,13 @@ def _flatten(values: dict[str, Any], prefix: str = "") -> dict[str, Any]:
 
 
 def training_config_differences(saved: dict[str, Any], current: ExperimentConfig) -> list[str]:
-    """Every training-relevant setting whose value differs from the checkpoint."""
-    old = _flatten(saved)
+    """Every training-relevant setting whose value differs from the checkpoint.
+
+    Keys added after a checkpoint was written take their default value, so
+    older checkpoints stay resumable as long as the new option is left at its
+    default (which reproduces the old behavior).
+    """
+    old = _flatten(config_to_dict(config_from_dict(saved)))
     new = _flatten(config_to_dict(current))
     differences = []
     for key in sorted(set(old) | set(new)):
@@ -129,6 +134,7 @@ class Trainer:
         self.source = DataSource(
             cfg.data.activation_manifest,
             skip_burn_in=cfg.data.skip_burn_in,
+            skip_leading_positions=cfg.data.skip_leading_positions,
             test_split=cfg.data.test_split,
             holdout_test_fraction=cfg.data.holdout_test_fraction,
         )

@@ -62,6 +62,10 @@ pip install -e ".[dev]"
 LeJEPA-SAEのshardはmemory mapで必要な行だけ読みます（`safetensors` パッケージは不要）。
 LeJEPA-SAEのmanifestは文書単位のtrain / validation / testを持つので、そのsplitをそのまま使います。
 
+**先頭トークンの除外（`data.skip_leading_positions=k`、sweepでは `SKIP_LEADING_POSITIONS=k`）**：保存された各系列の位置 `< k` を、正規化統計・学習・評価のすべてから除きます。位置0は各forward（LeJEPA-SAEでは `context_length` ごとの区切り）の先頭トークンです。Pythia-6.9B layer 16ではこの位置の ‖x‖²/d が他の約300倍あり、0.13%のサンプルで入力分散の約30%を占めます。そのため `s` とFVUの分母が歪みます。既定は0（除外しない＝従来と同じ挙動）です。JEPA-SAE形式ではmanifestのburn-inと合わせて `max(burn_in, k)` 未満の位置を除きます。
+- 正規化統計にも除外した位置を記録し、runの設定と一致しなければ学習前にエラーにします。`sj-compute-normalization --skip-leading-positions k` で作り直してください。
+- 第2段階では `DenseCheckpointFrontend.skip_leading_positions` を見て、同じ位置を除いてください。
+
 - train: manifestの `train` shard。**正規化統計はtrainからのみ計算**します。
 - validation / test: manifestに `test` があればそれを（LeJEPA-SAE形式は通常こちら）、なければ `validation` shardの後半半分をtestとして予約します（`data.test_split=auto`, `holdout_test_fraction=0.5`）。validation shardが1個しかない場合は、そのshard内で**系列単位**に分割します（`path#rows=start:stop`）。分割できない場合（系列が1本など）は学習前にエラーで停止します。shard・系列範囲の重複もエラーになります。
 - 学習開始時に `eval.required_splits`（既定 `[validation, test]`、sweepでは `EVAL_SPLITS` から設定）の各splitが空でなく、評価バッチを1つ以上作れることを確認します。validationだけで評価する場合は `data.test_split=none` と `eval.required_splits=[validation]`（sweepでは `EVAL_SPLITS=validation`）を指定してください。
@@ -84,6 +88,15 @@ bash scripts/stage1_sweep.sh
 
 全条件でデータ順序（`train.seed`由来）とモデル初期値（`torch.manual_seed(train.seed)`）が一致し、SIGReg用乱数は別管理です。
 50k stepへの延長は、新しい学習計画として `STEPS=50000` と別の `RUN_ROOT` で実行してください（schedulerが総step数に依存するため、10k runの再開では延長しません）。
+
+先頭トークンを除外した比較は、正規化統計が変わるので別の `RUN_ROOT` で実行します：
+
+```bash
+ACTIVATION_MANIFEST=../LeJEPA-SAE/data/the-pile/pythia-6.9b/layer-16-ctx1024-100m/manifest.json \
+RUN_ROOT=runs/stage1-skip-lead-50k SKIP_LEADING_POSITIONS=1 \
+WEIGHTS="0 0.0003 0.001 0.003" SEED=42 STEPS=50000 \
+bash scripts/stage1_sweep.sh
+```
 
 ### 個別コマンド
 

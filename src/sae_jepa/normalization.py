@@ -100,7 +100,12 @@ def check_normalization_matches(stats: dict[str, Any], source: DataSource) -> No
     if held_out & {parse_entry(entry)[0] for entry in stats["shards"]}:
         raise ValueError("normalization statistics include held-out shards")
     if int(stats["burn_in_excluded"]) != source.burn_in:
-        raise ValueError("normalization used a different burn-in policy")
+        raise ValueError(
+            "normalization excluded positions < "
+            f"{int(stats['burn_in_excluded'])} but the data source excludes positions < "
+            f"{source.burn_in}; recompute it with the same --skip-leading-positions "
+            "(data.skip_leading_positions) and burn-in policy"
+        )
 
 
 def normalize(h: torch.Tensor, mean: torch.Tensor, scale: float | torch.Tensor) -> torch.Tensor:
@@ -154,6 +159,13 @@ def fit_pca_whitening(
 def _source_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--activation-manifest", required=True)
     parser.add_argument("--no-skip-burn-in", action="store_true")
+    parser.add_argument(
+        "--skip-leading-positions",
+        type=int,
+        default=0,
+        help="drop token positions < k of every stored sequence (must match "
+        "data.skip_leading_positions of the runs that use these statistics)",
+    )
     parser.add_argument("--test-split", default="auto")
     parser.add_argument("--holdout-test-fraction", type=float, default=0.5)
 
@@ -162,6 +174,7 @@ def _source(args: argparse.Namespace) -> DataSource:
     return DataSource(
         args.activation_manifest,
         skip_burn_in=not args.no_skip_burn_in,
+        skip_leading_positions=args.skip_leading_positions,
         test_split=args.test_split,
         holdout_test_fraction=args.holdout_test_fraction,
     )

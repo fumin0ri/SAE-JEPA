@@ -14,6 +14,9 @@ SEED="${SEED:-42}"
 STEPS="${STEPS:-10000}"
 DEVICE="${DEVICE:-cuda}"
 EVAL_SPLITS="${EVAL_SPLITS:-validation test}"
+# Drop token positions < k of every stored sequence (1 = first token of each
+# segment) from normalization, training and evaluation.  0 keeps all positions.
+SKIP_LEADING_POSITIONS="${SKIP_LEADING_POSITIONS:-0}"
 EXTRA_ARGS=(${EXTRA_ARGS:-})
 # Every split evaluated below must exist before any training starts; the
 # trainer checks eval.required_splits at startup and stops otherwise.
@@ -26,7 +29,8 @@ python -m pip freeze > "$RUN_ROOT/python-environment.txt" 2>/dev/null || true
 NORMALIZATION="$RUN_ROOT/normalization.pt"
 if [[ ! -f "$NORMALIZATION" ]]; then
   echo "Computing train-only normalization statistics"
-  sj-compute-normalization --activation-manifest "$ACTIVATION_MANIFEST" --output "$NORMALIZATION"
+  sj-compute-normalization --activation-manifest "$ACTIVATION_MANIFEST" \
+    --skip-leading-positions "$SKIP_LEADING_POSITIONS" --output "$NORMALIZATION"
 fi
 
 for weight in $WEIGHTS; do
@@ -38,11 +42,13 @@ for weight in $WEIGHTS; do
     --set "name=$name" \
     --set "data.activation_manifest=$ACTIVATION_MANIFEST" \
     --set "data.normalization_path=$NORMALIZATION" \
+    --set "data.skip_leading_positions=$SKIP_LEADING_POSITIONS" \
     --set "sigreg.weight=$weight" \
     --set "optim.steps=$STEPS" \
     --set "train.seed=$SEED" \
     --set "train.device=$DEVICE" \
-    --set "train.output_dir=$run_dir"     --set "eval.required_splits=$REQUIRED_SPLITS" \
+    --set "train.output_dir=$run_dir" \
+    --set "eval.required_splits=$REQUIRED_SPLITS" \
     "${EXTRA_ARGS[@]}"
   for split in $EVAL_SPLITS; do
     sj-evaluate-dense --checkpoint "$run_dir/checkpoints/latest.pt" --split "$split" --device "$DEVICE"
