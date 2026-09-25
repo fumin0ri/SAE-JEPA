@@ -134,6 +134,34 @@ checkpoint評価（`eval-{split}-step-*.json`）:
 | 情報保持 | 元残差空間の MSE・FVU（FVUは評価split全体の平均を基準） |
 | Gaussian化 | held-out SIGReg（固定validation射影）、`mean_sq_per_dim`、分散、`cov_fro_dev = ‖Cov(y)−I‖_F/√d`、固有値スペクトル・有効ランク |
 | 診断 | 学習に使わない射影上の W₂²・SIGReg・分位点のずれ |
+| 外れ値診断 | 下記 |
+
+### 外れ値・低ランク化の診断
+
+ランダム射影のSIGRegは、(a) ごく少数の極端なサンプルと、(b) 全分散を保ったまま低次元の部分空間に集中する低ランク化の、どちらもほとんど検出できません。詳細評価ではこの2つを切り分ける指標を出します。
+
+| 指標 | 意味 |
+|---|---|
+| `gaussian/y_sqnorm_q{0.5,0.9,0.99,0.999,1}` | 各サンプルの ‖y‖²/d の分位点（Gaussianなら≈1±0.02、`reference/...` と比較） |
+| `input/x_sqnorm_*`、`reconstruction/sample_error_*` | 正規化入力 ‖x‖²/d と再構成誤差のサンプル分布（外れ値が入力由来かを見る） |
+| `leading/*`、`nonleading/*` | 系列内の位置が `eval.leading_positions` 未満（既定：先頭トークン）とそれ以外の平均 ‖y‖²/d・‖x‖²/d・誤差、SSEに占める割合 |
+| `reconstruction/fvu_excluding_leading` | 先頭トークンを除いたFVU |
+| `outliers/*` | ‖y‖²上位 `eval.outlier_fraction`（既定0.1%）の件数、先頭トークンの割合、‖y‖²総和に占める割合、系列内位置のヒストグラム |
+| `outliers/top` | ‖y‖²上位 `eval.outlier_table_size` 件の shard・系列・位置・‖y‖²・‖x‖²・誤差（JSONのみ） |
+| `gaussian/excl_leading/cov_*` | 先頭トークンを除いた共分散（‖Cov−I‖、最大固有値、有効ランクなど） |
+| `gaussian/trimmed/cov_*` | ‖y‖²上位を除いた共分散（全体のモーメントから厳密に差し引き） |
+
+- 外れ値が原因なら、`excl_leading` か `trimmed` で有効ランクと最大固有値が参照値に近づきます。
+- 低ランク化が原因なら、除いても有効ランクは低いままです。
+- 固有値スペクトル（全体・先頭除外・上位除外、同じ件数のGaussian参照）は `eval-*-spectra.pt` に保存し、レポートでは `{split}_spectra.png` に描きます。
+
+既存のcheckpointも、学習し直さずにこの診断で再評価できます（新しい `eval.*` 設定には既定値が入ります）：
+
+```bash
+RUN_ROOT=runs/stage1-pilot bash scripts/evaluate_stage1.sh
+```
+
+診断の設定は `EVAL_ARGS="--set eval.leading_positions=4 --set eval.outlier_fraction=0.01"` のように変えられます（`eval.*` 以外は変更不可）。
 
 **評価バッチ**：同じ文書内の連続トークンは強く相関するため、保存順のバッチでは各トークンの分布がGaussianでもバッチ単位のSIGRegが大きく出ます。そこで評価専用の固定seed（`eval.sample_seed`）で**split全体（全shard・全系列）から** `eval.batches × eval.batch_size` 個の位置を非復元抽出し、ランダムな順序でバッチに割り当てます（`eval.batches=0` なら全フルバッチ）。抽出はデータとseedだけで決まるため、全λ・全checkpointが同一のバッチで評価されます。読み込みはmemory mapで行い、必要な行だけを読みます。
 
@@ -161,6 +189,10 @@ dead featureや「正なら発火」などの疎モデル用指標は密モデ�
 - 系列内で強く相関する（周辺は標準Gaussianの）データで、保存順バッチのSIGRegは参照値より大きく、シャッフル評価では参照値近くになる
 - validation shardが1個なら系列単位で分割し、分割不能・必須splitが空なら学習前に停止する
 - 学習に影響する設定を変えた再開を拒否し、ログ・評価設定の変更は許可する
+- 評価バッチの各行のshard・系列・系列内位置が、両形式で実データと一致する
+- 先頭トークンに入れた外れ値を検出して帰属させ、除外・上位除外後の共分散が参照値に戻る
+- 全分散を保った低ランク化は、除外・上位除外後も低ランクとして残る
+- 上位除外のモーメント差し引きが、残りのサンプルで計算し直した値と一致する
 
 ## 構成
 

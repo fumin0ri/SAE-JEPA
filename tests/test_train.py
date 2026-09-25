@@ -87,7 +87,10 @@ def test_validation_does_not_touch_training_randomness(manifest, tmp_path):
     data_state = trainer.data.state_dict()
     first = trainer.validate(detailed=True)
     second = trainer.validate(detailed=True)
+    first_spectra, second_spectra = first.pop("_spectra"), second.pop("_spectra")
     assert first == second
+    assert first_spectra.keys() == second_spectra.keys()
+    assert all(torch.equal(first_spectra[k], second_spectra[k]) for k in first_spectra)
     assert torch.equal(torch_state, torch.get_rng_state())
     assert torch.equal(sigreg_state, trainer.sigreg.generator.get_state())
     assert data_state == trainer.data.state_dict()
@@ -112,6 +115,10 @@ def test_end_to_end_checkpoint_frontend_and_report(manifest, tmp_path):
     h = torch.randn(4, 16)
     assert torch.equal(frontend.encode_dense(h), model.encode_dense(h))
     assert not any(p.requires_grad for p in frontend.parameters())
+    spectra = torch.load(run / final["spectra_path"], weights_only=False)
+    assert {"full", "excl_leading", "trimmed"} <= spectra.keys()
     rows = collect(tmp_path / "runs")
-    write_report(rows, tmp_path / "report")
-    assert (tmp_path / "report" / "validation.md").exists()
+    write_report(rows, tmp_path / "report", run_root=tmp_path / "runs")
+    report = (tmp_path / "report" / "validation.md").read_text(encoding="utf-8")
+    assert "Outlier diagnostics" in report
+    assert (tmp_path / "report" / "validation_spectra.png").exists()

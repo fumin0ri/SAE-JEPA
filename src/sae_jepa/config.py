@@ -89,6 +89,15 @@ class EvalConfig:
     quantiles: tuple[float, ...] = (0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99)
     maximum_quantile_samples: int = 65_536
     gaussian_reference_seed: int = 4242
+    # Outlier diagnostics (detailed evaluation only).  Token positions below
+    # leading_positions (position 0 = first token of each stored sequence) are
+    # reported separately; covariance is also reported without them and
+    # without the top outlier_fraction of samples by ||y||^2.
+    leading_positions: int = 1
+    outlier_fraction: float = 0.001
+    outlier_buffer: int = 1024  # max samples that can be trimmed
+    outlier_table_size: int = 32
+    norm_quantiles: tuple[float, ...] = (0.5, 0.9, 0.99, 0.999, 1.0)
 
 
 @dataclass
@@ -136,6 +145,11 @@ def _update(target: Any, values: dict[str, Any], prefix: str = "") -> None:
             _update(current, value, f"{prefix}{key}.")
         else:
             setattr(target, key, _coerce(value, current))
+
+
+def update_config(cfg: ExperimentConfig, values: dict[str, Any]) -> None:
+    """Apply a nested mapping of settings to ``cfg`` (unknown keys raise)."""
+    _update(cfg, values)
 
 
 def parse_override(text: str) -> dict[str, Any]:

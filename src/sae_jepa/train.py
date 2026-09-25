@@ -22,7 +22,7 @@ import torch.nn.functional as F
 
 from .config import ExperimentConfig, config_to_dict, load_config
 from .data import DataSource, TrainBatches, mix_seed, write_json
-from .evaluate import evaluate_model
+from .evaluate import evaluate_model, write_evaluation
 from .models import ARCHITECTURE_ID, DenseSIGRegAE, build_model
 from .normalization import (
     compute_train_statistics,
@@ -409,7 +409,7 @@ class Trainer:
                     "seed": cfg.train.seed,
                 }
             )
-            write_json(self.output_dir / f"eval-validation-step-{self.step:07d}.json", final)
+            write_evaluation(final, self.output_dir / f"eval-validation-step-{self.step:07d}.json")
             return final
         return {}
 

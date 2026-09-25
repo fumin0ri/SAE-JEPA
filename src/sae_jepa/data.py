@@ -380,17 +380,26 @@ class DataSource:
     def split_positions(self, split: str) -> int:
         return sum(int(self.sequence_counts(entry).sum()) for entry in self.paths(split))
 
-    def gather(self, entry: str, local: torch.Tensor) -> torch.Tensor:
-        """Rows ``local`` (indices in :meth:`positions` order) read via a memory map."""
-        if self.format == LEJEPA_FORMAT:
-            return read_safetensors_rows(self._resolve(entry)[0], self._flat_rows(entry, local))
-        path, start, _ = self._resolve(entry)
+    def locate(self, entry: str, local: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sequence index (within the shard file) and token position of rows ``local``.
+
+        The token position counts from the start of the stored sequence, i.e.
+        position 0 is the first token the model saw in that forward pass.
+        """
+        _, start, _ = parse_entry(entry)
         counts = self.sequence_counts(entry)
         ends = counts.cumsum(0)
         sequence = torch.searchsorted(ends, local, right=True)
         position = self.burn_in + local - (ends - counts)[sequence]
-        activations, _ = load_sequence_shard(path, self.sequence_length, mmap=True)
-        return activations[sequence + start, position].clone()
+        return sequence + start, position
+
+    def gather(self, entry: str, local: torch.Tensor) -> torch.Tensor:
+        """Rows ``local`` (indices in :meth:`positions` order) read via a memory map."""
+        if self.format == LEJEPA_FORMAT:
+            return read_safetensors_rows(self._resolve(entry)[0], self._flat_rows(entry, local))
+        sequence, position = self.locate(entry, local)
+        activations, _ = load_sequence_shard(self._resolve(entry)[0], self.sequence_length, mmap=True)
+        return activations[sequence, position].clone()
 
     def record(self) -> dict[str, Any]:
         """Data manifest record stored with checkpoints and reports."""
@@ -518,7 +527,8 @@ def eval_batches(
     maximum_batches: int = 0,
     seed: int = 0,
     chunk_batches: int = 16,
-) -> Iterator[torch.Tensor]:
+    with_metadata: bool = False,
+) -> Iterator[Any]:
     """Fixed, shuffled evaluation batches drawn from the whole held-out split.
 
     Consecutive tokens of one document are strongly correlated, so storage-order
@@ -531,6 +541,10 @@ def eval_batches(
     lambda sees identical batches.  All batches have the same ``N`` because the
     N-scaled SIGReg statistic is only comparable at a fixed batch size.  Rows
     are read through memory maps in chunks of ``chunk_batches`` batches.
+
+    With ``with_metadata`` each item is ``(rows, meta)`` where ``meta`` holds
+    ``entry`` (index into ``source.paths(split)``), ``sequence`` (index within
+    the shard file) and ``position`` (token position within that sequence).
     """
     if split == "train":
         raise ValueError("evaluation batches are only drawn from held-out splits")
@@ -553,12 +567,25 @@ def eval_batches(
         slots = order[chunk_start : chunk_start + step]
         owner = torch.searchsorted(ends, slots, right=True)
         buffer: torch.Tensor | None = None
+        sequence = torch.empty(len(slots), dtype=torch.long)
+        position = torch.empty(len(slots), dtype=torch.long)
         for index in torch.unique(owner).tolist():
             mask = owner == index
-            rows = source.gather(entries[index], slots[mask] - starts[index])
+            local = slots[mask] - starts[index]
+            rows = source.gather(entries[index], local)
             if buffer is None:
                 buffer = torch.empty(len(slots), rows.shape[-1], dtype=rows.dtype)
             buffer[mask] = rows
+            if with_metadata:
+                sequence[mask], position[mask] = source.locate(entries[index], local)
         assert buffer is not None
         for offset in range(0, len(slots), batch_size):
-            yield buffer[offset : offset + batch_size]
+            rows = buffer[offset : offset + batch_size]
+            if not with_metadata:
+                yield rows
+                continue
+            yield rows, {
+                "entry": owner[offset : offset + batch_size],
+                "sequence": sequence[offset : offset + batch_size],
+                "position": position[offset : offset + batch_size],
+            }
