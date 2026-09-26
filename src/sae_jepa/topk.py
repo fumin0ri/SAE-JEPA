@@ -20,12 +20,16 @@ class TopKSAE(nn.Module):
             self.encoder.weight.copy_(self.decoder.weight.T)
             self.encoder.bias.zero_()
 
-    def forward(self, x):
+    def encode(self, x):
         pre = self.encoder(x - self.bias)
         values, indices = torch.topk(pre, self.k, dim=-1)
         # ReLU after selection permits fewer than K positive features.
         values = values.relu()
         z = torch.zeros_like(pre).scatter(-1, indices, values)
+        return z
+
+    def forward(self, x):
+        z = self.encode(x)
         return self.decoder(z) + self.bias, z
 
     @torch.no_grad()

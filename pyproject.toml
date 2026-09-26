@@ -18,6 +18,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
 text = ["transformers>=4.40"]
+probe = ["transformers>=4.40,<5", "datasets>=2.19"]
 
 [project.scripts]
 sj-compute-normalization = "sae_jepa.normalization:main"
@@ -26,6 +27,7 @@ sj-train-dense = "sae_jepa.train:main"
 sj-evaluate-dense = "sae_jepa.evaluate:main"
 sj-diagnose-dense = "sae_jepa.diagnose:main"
 sj-stage2 = "sae_jepa.stage2:main"
+sj-probe = "sae_jepa.probing:main"
 sj-report-dense = "sae_jepa.reporting:main"
 sj-make-synthetic = "sae_jepa.synthetic:main"
 

@@ -7,6 +7,10 @@ LLM残差ストリームに対し、**Top-K SAEの前段として「再構成＋
 
 第2段階の実行・再開・評価方法は **[docs/stage2.md](docs/stage2.md)** を参照してください。
 
+**probe性能が主目的の評価**は **[docs/probing.md](docs/probing.md)** を参照してください。
+`sj-probe`で既存stage-2 checkpointに対するTop-1 / Top-2 / Top-5 sparse probingを比較できます。
+再構成FVUのみで前段の優劣を判断しないでください。
+
 ## モデル（`model.type = dense_sigreg_ae`）
 
 ```text
