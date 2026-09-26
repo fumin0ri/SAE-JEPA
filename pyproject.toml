@@ -25,6 +25,7 @@ sj-fit-pca = "sae_jepa.normalization:pca_main"
 sj-train-dense = "sae_jepa.train:main"
 sj-evaluate-dense = "sae_jepa.evaluate:main"
 sj-diagnose-dense = "sae_jepa.diagnose:main"
+sj-stage2 = "sae_jepa.stage2:main"
 sj-report-dense = "sae_jepa.reporting:main"
 sj-make-synthetic = "sae_jepa.synthetic:main"
 

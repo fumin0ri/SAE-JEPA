@@ -1,0 +1,23 @@
+# Pilot: same settings and sample order for all frozen dense checkpoints.
+dictionary_size: 16384
+k: 64
+seed: 42
+steps: 10000
+batch_size: 512
+lr: 0.0001
+weight_decay: 0.0
+warmup_steps: 500
+decay_fraction: 0.2
+gradient_clip: 1.0
+amp_dtype: bfloat16
+shards_per_window: 4
+calibration_batches: 64
+calibration_seed: 91001
+eval_batch_size: 512
+eval_batches: 64
+eval_seed: 31337
+validation_every: 1000
+validation_batches: 16
+log_every: 100
+checkpoint_every: 1000
+required_splits: [validation]
