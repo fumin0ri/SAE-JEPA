@@ -17,12 +17,14 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+text = ["transformers>=4.40"]
 
 [project.scripts]
 sj-compute-normalization = "sae_jepa.normalization:main"
 sj-fit-pca = "sae_jepa.normalization:pca_main"
 sj-train-dense = "sae_jepa.train:main"
 sj-evaluate-dense = "sae_jepa.evaluate:main"
+sj-diagnose-dense = "sae_jepa.diagnose:main"
 sj-report-dense = "sae_jepa.reporting:main"
 sj-make-synthetic = "sae_jepa.synthetic:main"
 

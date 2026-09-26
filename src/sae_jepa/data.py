@@ -121,7 +121,8 @@ def _safetensors_array(path: Path, name: str = "activations") -> tuple[np.memmap
     if name not in header:
         raise ValueError(f"{path} has no tensor {name!r}")
     info = header[name]
-    dtypes = {"BF16": np.uint16, "F16": np.float16, "F32": np.float32}
+    dtypes = {"BF16": np.uint16, "F16": np.float16, "F32": np.float32,
+              "I32": np.int32, "I64": np.int64}
     if info["dtype"] not in dtypes:
         raise ValueError(f"unsupported safetensors dtype {info['dtype']} in {path}")
     begin = info["data_offsets"][0]

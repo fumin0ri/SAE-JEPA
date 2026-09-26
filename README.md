@@ -224,3 +224,69 @@ dead featureや「正なら発火」などの疎モデル用指標は密モデ�
 | `src/sae_jepa/frontends.py` | 第2段階用の固定前段（Raw/PCA/Dense） |
 | `configs/` | Dense-AE / Dense-SIGReg-AE |
 | `scripts/` | sweep・評価・スモークテスト |
+# Fixed-validation checkpoint diagnostics
+
+Use existing checkpoints to compare residual non-Gaussianity before scheduling
+another training sweep. This command does **not** train or recompute normalization:
+
+```bash
+pip install -e .
+BASE=runs/stage1-skip-lead-100k-v2
+sj-diagnose-dense \
+  --checkpoints \
+    "$BASE/lambda-0/seed-42/checkpoints/latest.pt" \
+    "$BASE/lambda-0p0003/seed-42/checkpoints/latest.pt" \
+    "$BASE/lambda-0p001/seed-42/checkpoints/latest.pt" \
+  --output runs/diagnosis-opt0p5 \
+  --device cuda
+```
+
+Select the directory containing the **0.5 decay experiment**, not a directory
+subsequently overwritten by a 0.75 experiment. Resolved checkpoint configs are
+included in the output so this can be checked. An existing nonempty output
+directory is rejected. Use `--activation-manifest /path/to/manifest.json` when
+moving checkpoints; source identity, split assignment and exclusions are checked.
+
+Defaults: 64 random validation batches of 512 tokens, sample seed 31337, three
+fresh diagnostic projection seeds (901, 902, 903), 256 directions per seed,
+and trimming fractions 0.001 and 0.01. The same cached token IDs and batch
+boundaries are used for every checkpoint. Comparisons require identical source,
+normalization, exclusions, latent dimension and SIGReg integration convention.
+Override `--seeds`, `--projections`, `--batches` and `--trim-fractions` as needed.
+Only bounded, positive `--batches` are allowed to avoid caching an entire dataset.
+
+Outputs:
+
+- `diagnosis.json`, `samples.pt`: configuration, source identity and exact sample
+  IDs/hash, including shard, sequence and position mappings.
+- `model-XX.json`: full and trimmed covariance metrics, original-space FVU,
+  per-projection-seed SIGReg/W2 and their mean/std/range, Gaussian references,
+  removed sample indices, and top **input** / **latent** norm token contexts.
+- `model-XX-spectra.pt`, `spectra.png`: complete eigenvalue spectra for every
+  subset and its Gaussian reference; the figure overlays full Gaussian spectra.
+- `summary.md`: comparison table. Projection-seed std measures projection Monte
+  Carlo variation, **not** uncertainty over training seeds or independent datasets.
+
+Input-norm trimming removes the same tokens across checkpoints. Latent-norm
+trimming removes model-specific tokens; do not interpret it as a common evaluation
+population. Both preserve original batch boundaries (no contiguous re-batching).
+SIGReg/W2 are unweighted means over nonempty retained batches, with reference
+batch sizes matched exactly. The input-selected Gaussian reference uses the same
+sample indices. For latent selection it removes the largest Gaussian norms
+**within each batch to match the retained counts**; this is a size-matched
+norm-selection comparison, not an exact Gaussian null for global top-k selection.
+Trimmed FVU recomputes the centered input variance of each retained subset.
+
+LeJEPA-SAE safetensors provide token IDs and document/segment identifiers; contexts
+are clipped to the stored sequence boundaries. Other formats or missing token IDs
+are explicitly marked unavailable. For decoded text, install `pip install -e
+'.[text]'` and pass `--tokenizer /local/path/to/the/extraction/tokenizer`. Tokenizer
+loading is local-only; use the exact tokenizer/revision used for extraction.
+Without it, token IDs and contexts are still exported. No LLM or source text
+download is required. Exported contexts may contain dataset text.
+
+CPU activation/latent caching needs several GB RAM for 32768 x 4096 samples.
+Covariances/eigendecompositions run on `--device`; models are processed one at a
+time. `--device cpu` works for small checks but full-dimensional eigenspectra can
+be slow. A quick smoke run is `--batches 4 --projections 32 --seeds 901
+--trim-fractions 0.001`; use the larger default sample for scientific conclusions.
