@@ -187,6 +187,8 @@ dead featureや「正なら発火」などの疎モデル用指標は密モデ�
 
 重み、optimizer、scheduler、乱数状態（torch/cuda/SIGReg generator/データiterator）、`mu, s`、データmanifest記録（fingerprint・split別shard）、解決済みconfig、SIGReg規約。
 
+既定では `train.checkpoint_every` stepごとに `checkpoints/latest.pt` だけを上書き保存します（4096幅のモデルでAdamWの状態込み約0.6GB）。再開・評価・第2段階の前段はこのファイルだけを読みます。途中のcheckpointも残したい場合は `--set train.keep_checkpoints=true` を指定すると、`checkpoints/step-XXXXXXX.pt` のコピーも保存します（1回の保存ごとに約0.6GB増えます）。既存の `step-*.pt` は自動では削除しません。
+
 ## 検証（`pytest`）
 
 - 正規化→逆変換で入力を復元できる／統計がtrain行の直接計算と一致する

@@ -39,6 +39,7 @@ train:
   validation_every: 1000
   validation_batches: 16
   checkpoint_every: 2000
+  keep_checkpoints: false        # true also keeps checkpoints/step-XXXXXXX.pt (~0.6 GB each)
 eval:
   batch_size: 512
   batches: 64

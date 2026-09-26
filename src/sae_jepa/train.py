@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import time
 from pathlib import Path
 from typing import Any
@@ -289,22 +290,25 @@ class Trainer:
         }
 
     def save_checkpoint(self) -> Path:
+        """Atomically write ``checkpoints/latest.pt`` (the only file that resume,
+        evaluation and stage-2 front-ends read).
+
+        With ``train.keep_checkpoints`` a copy is also kept as ``step-XXXXXXX.pt``
+        for later analysis.  Without it (the default) nothing else is written,
+        and existing ``step-*.pt`` files from earlier runs are left untouched.
+        """
         directory = self.output_dir / "checkpoints"
         directory.mkdir(parents=True, exist_ok=True)
-        state = self.checkpoint_state()
-        path = directory / f"step-{self.step:07d}.pt"
-        partial = path.with_suffix(".pt.partial")
-        torch.save(state, partial)
-        partial.replace(path)
         latest = directory / "latest.pt"
         partial = latest.with_suffix(".pt.partial")
-        torch.save(state, partial)
+        torch.save(self.checkpoint_state(), partial)
+        if self.cfg.train.keep_checkpoints:
+            step_path = directory / f"step-{self.step:07d}.pt"
+            step_partial = step_path.with_suffix(".pt.partial")
+            shutil.copyfile(partial, step_partial)
+            step_partial.replace(step_path)
         partial.replace(latest)
-        if not self.cfg.train.keep_checkpoints:
-            for old in directory.glob("step-*.pt"):
-                if old != path:
-                    old.unlink()
-        return path
+        return latest
 
     def load_checkpoint(self, path: str | Path) -> None:
         state = torch.load(Path(path), map_location="cpu", weights_only=False)

@@ -73,7 +73,9 @@ class TrainConfig:
     validation_every: int = 1000
     validation_batches: int = 16
     checkpoint_every: int = 2000
-    keep_checkpoints: bool = True
+    # False: only checkpoints/latest.pt (~0.6 GB for the 4096-wide model incl.
+    # AdamW state) is written.  True: also keep a step-XXXXXXX.pt copy per save.
+    keep_checkpoints: bool = False
 
 
 @dataclass
