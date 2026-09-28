@@ -1,0 +1,44 @@
+# Full/masked shared encoder: consistency + two-view SIGReg. No decoder.
+name: masked_sigreg
+model:
+  type: masked_sigreg_encoder
+  d_in: 0
+  d_hidden: 4096
+  d_latent: 4096
+  activation: gelu
+data:
+  activation_manifest: ""
+  normalization_path: ""
+  skip_leading_positions: 1
+masking:
+  probability: 0.25
+  seed_offset: 2000003
+  validation_seed: 81001
+sigreg:
+  weight: 0.001   # exploration starting point, not transferred optimal AE weight
+  num_projections: 256
+  t_min: -5.0
+  t_max: 5.0
+  num_points: 17
+  scale_by_batch_size: true
+  resample_every_step: true
+optim:
+  batch_size: 512
+  lr: 0.0001
+  weight_decay: 0.0
+  steps: 100000
+  warmup_steps: 1000
+  decay_fraction: 0.5
+  amp_dtype: bfloat16
+train:
+  output_dir: runs/stage1-masked
+  seed: 42
+  device: cuda
+  log_every: 100
+  validation_every: 1000
+  validation_batches: 16
+  checkpoint_every: 2000
+eval:
+  required_splits: [validation]
+  batch_size: 512
+  batches: 64

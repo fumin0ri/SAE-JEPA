@@ -74,4 +74,23 @@ class DenseSIGRegAE(nn.Module):
 def build_model(cfg: ModelConfig, mean: torch.Tensor, scale: float) -> nn.Module:
     if cfg.type == "dense_sigreg_ae":
         return DenseSIGRegAE(cfg, mean, scale)
+    if cfg.type == "masked_sigreg_encoder":
+        return MaskedSIGRegEncoder(cfg, mean, scale)
     raise ValueError(f"unknown model.type {cfg.type!r}")
+
+
+class MaskedSIGRegEncoder(DenseSIGRegAE):
+    """Shared full/masked encoder. No reconstruction decoder is trained or saved."""
+
+    def __init__(self, cfg: ModelConfig, mean: torch.Tensor, scale: float):
+        super().__init__(cfg, mean, scale)
+        del self.decoder
+
+    def decode_normalized(self, y: torch.Tensor) -> torch.Tensor:
+        raise ValueError("masked encoder has no decoder; fit a frozen-encoder readout first")
+
+    def forward(self, h: torch.Tensor) -> dict[str, torch.Tensor]:
+        if h.ndim != 2 or h.shape[-1] != self.cfg.d_in:
+            raise ValueError("h must have shape [batch, d_in]")
+        x = self.normalize(h)
+        return {"x": x, "y": self.encode_normalized(x)}

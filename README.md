@@ -1,5 +1,11 @@
 # SAE-JEPA
 
+**再構成を使わないStage1比較**として、full / 座標mask入力を共有encoderへ通し、
+表現の一致＋両viewへのSIGRegで学習する`sj-masked`を追加しました。
+25% / 50% maskのsweep、再開、Gaussian性・共分散評価は
+[docs/masked_stage1.md](docs/masked_stage1.md)を参照してください。
+この方式にはdecoderがなく、以下の再構成付きAE経路とは専用コマンドで分けています。
+
 LLM残差ストリームに対し、**Top-K SAEの前段として「再構成＋SIGReg」で密なGaussian化表現を作る**ための実験コードです。
 [LeJEPA-SAE](https://github.com/fumin0ri/LeJEPA-SAE)（`extract`、safetensors）と [JEPA-SAE](https://github.com/fumin0ri/JEPA-SAE)（`sr-extract-pile`）の活性抽出フォーマットをそのまま読み込みます。
 

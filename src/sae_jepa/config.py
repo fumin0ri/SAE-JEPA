@@ -107,6 +107,13 @@ class EvalConfig:
 
 
 @dataclass
+class MaskingConfig:
+    probability: float = 0.25
+    seed_offset: int = 2_000_003
+    validation_seed: int = 81_001
+
+
+@dataclass
 class ExperimentConfig:
     name: str = "dense_sigreg_ae"
     data: DataConfig = field(default_factory=DataConfig)
@@ -115,10 +122,15 @@ class ExperimentConfig:
     optim: OptimConfig = field(default_factory=OptimConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
     eval: EvalConfig = field(default_factory=EvalConfig)
+    masking: MaskingConfig = field(default_factory=MaskingConfig)
 
     def validate(self) -> None:
-        if self.model.type != "dense_sigreg_ae":
+        if self.model.type not in {"dense_sigreg_ae", "masked_sigreg_encoder"}:
             raise ValueError(f"unknown model.type {self.model.type!r}")
+        if not 0 < self.masking.probability < 1:
+            raise ValueError("masking.probability must lie strictly between 0 and 1")
+        if self.model.type == "masked_sigreg_encoder" and not self.sigreg.weight > 0:
+            raise ValueError("masked consistency requires sigreg.weight > 0 to oppose collapse")
         if self.sigreg.weight < 0:
             raise ValueError("sigreg.weight must be non-negative")
         if self.data.skip_leading_positions < 0:

@@ -483,6 +483,8 @@ def load_checkpoint_model(
     path: str | Path, device: torch.device
 ) -> tuple[DenseSIGRegAE, dict[str, Any]]:
     state = torch.load(Path(path), map_location="cpu", weights_only=False)
+    if state.get("config", {}).get("model", {}).get("type") == "masked_sigreg_encoder":
+        raise ValueError("masked encoder has no reconstruction decoder; use sj-masked evaluate")
     if state.get("architecture_id") != ARCHITECTURE_ID:
         raise ValueError(f"unsupported checkpoint {path}")
     cfg = config_from_dict(state["config"])

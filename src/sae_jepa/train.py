@@ -121,6 +121,9 @@ def rms(value: torch.Tensor) -> float:
 
 class Trainer:
     def __init__(self, cfg: ExperimentConfig):
+        cfg.validate()
+        if type(self) is Trainer and cfg.model.type == "masked_sigreg_encoder":
+            raise ValueError("use sj-masked train for masked_sigreg_encoder")
         self.cfg = cfg
         if not cfg.train.output_dir:
             raise ValueError("train.output_dir must be set")
@@ -400,7 +403,7 @@ class Trainer:
                     if "train" in record:
                         t = record["train"]
                         print(
-                            f"step {self.step}: rec={t['reconstruction_normalized_mse']:.4f}"
+                            f"step {self.step}: loss={t['loss']:.4f}"
                             + (f" sigreg={t['sigreg']:.3f}" if "sigreg" in t else "")
                             + f" lr={t['lr']:.2e}",
                             flush=True,
