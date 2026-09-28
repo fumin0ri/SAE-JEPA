@@ -47,10 +47,19 @@ h → 固定encoder → y → (y−μy)/sy → Top-K SAE → û
                      ŷ = sy û + μy → 固定decoder → ĥ
 ```
 
+- 前段は、stage-1 Dense checkpointか、`sj-make-raw-frontend` / `sj-fit-pca` が書く前段ファイル（`sae-jepa-frontend-v1`）です。
+  Raw/PCAはfloat32で計算し、decoderは厳密な逆写像です。
+  preflightでは、データ・分割・先頭除外・入力正規化 `μ, s`・前段の出力次元が全候補で一致することを確認します。
+- `loss_space: latent`（既定、従来通り）は `mean((û−u)^2)` です。
+  `original` は `mean((D(ŷ) − x)^2)`（`x=(h−μ)/s`）で、固定decoderを通して勾配を流します。
+  `sj-stage2 sweep --loss-spaces latent original` で、各前段を両方の損失で学習します。
+  reportとprobeが比較で許す設定の違いは、損失空間だけです。
+  詳細は[whitening.md](whitening.md)を参照してください。
+
 - `μy, sy`は**trainのみ**から64バッチをサンプリングして推定し、その後固定します。
   全条件でcalibration seed・データ順を共有します。`sy`は全座標共通のスカラーです。
   λによる平均・全体振幅の差を除き、共分散の異方性を保持します。白色化やトークンごとの正規化はしません。
-- 損失はSAE入力空間のMSE `mean((û−u)^2)`。第1段階へ勾配は流しません。
+- 損失は`loss_space`で選びます（上記）。前段のパラメータは更新しません。
 - SAEは各トークンで上位K個を選択してReLUを適用します。正値が少なければ実際の発火数はK未満です。
 - encoder/decoderは学習中は非共有。初期encoderはdecoderの転置、decoder列は単位ノルム。
   decoder勾配の半径方向成分を除き、更新後も列を単位ノルムへ戻します。

@@ -3,9 +3,10 @@
 LLM残差ストリームに対し、**Top-K SAEの前段として「再構成＋SIGReg」で密なGaussian化表現を作る**ための実験コードです。
 [LeJEPA-SAE](https://github.com/fumin0ri/LeJEPA-SAE)（`extract`、safetensors）と [JEPA-SAE](https://github.com/fumin0ri/JEPA-SAE)（`sr-extract-pile`）の活性抽出フォーマットをそのまま読み込みます。
 
-本リポジトリは **第1段階**（密な前段表現の学習と評価）と、**第2段階のDense checkpoint間Top-K SAE比較**（`sj-stage2`）を実装しています。第2段階では前段のencoder・decoder・正規化を固定し、SAEだけを学習します。Raw・PCA whiteningの前段インターフェースもありますが、今回のstage-2コマンドの対象はDense-AE / Dense-SIGReg-AEです。
+本リポジトリは **第1段階**（密な前段表現の学習と評価）と、**第2段階のTop-K SAE比較**（`sj-stage2`）を実装しています。第2段階では前段のencoder・decoder・正規化を固定し、SAEだけを学習します。前段はDense-AE / Dense-SIGReg-AE checkpointに加え、Raw（`sj-make-raw-frontend`）とPCA whitening（`sj-fit-pca`）を使えます。SAE損失は潜在空間（`loss_space=latent`）か、固定decoderを通した元の空間（`original`）で測れます。
 
 第2段階の実行・再開・評価方法は **[docs/stage2.md](docs/stage2.md)** を参照してください。
+PCA whitening・Raw対照実験は **[docs/whitening.md](docs/whitening.md)** を参照してください。
 
 **probe性能が主目的の評価**は **[docs/probing.md](docs/probing.md)** を参照してください。
 `sj-probe`で既存stage-2 checkpointに対するTop-1 / Top-2 / Top-5 sparse probingを比較できます。
@@ -24,7 +25,7 @@ s^2 = E_train ||h - mu||^2 / 4096
 ```
 
 - `h`: Pythia-6.9B layer 16 残差（4,096次元）。
-- 平均と全体スケールのみ揃え、相関・分布形状の変換はencoderに任せます。PCA whiteningはモデル内に入れず、独立した比較条件（`sj-fit-pca`, `frontends.PCAWhiteningFrontend`）として用意しています。
+- 平均と全体スケールのみ揃え、相関・分布形状の変換はencoderに任せます。PCA whiteningはモデル内に入れず、独立したstage-2前段（`sj-fit-pca`, `frontends.PCAWhiteningFrontend`）として用意しています。
 - BatchNorm/LayerNorm、ReLU出力、TopK、L1、発火率損失はありません。
 - `L_rec` は正規化空間でのMSEで、train尺度でのFVUに相当します。
 
@@ -114,7 +115,8 @@ sj-train-dense --config configs/dense_sigreg_ae.yaml \
   --set sigreg.weight=0.1 --set train.output_dir=runs/x/lambda-0p1
 sj-evaluate-dense --checkpoint runs/x/lambda-0p1/checkpoints/latest.pt --split test
 sj-report-dense --run-root runs/x
-sj-fit-pca --activation-manifest MANIFEST --normalization runs/x/normalization.pt --output runs/x/pca.pt
+sj-fit-pca --like runs/x/lambda-0/seed-42/checkpoints/latest.pt --output runs/x-frontends/pca.pt
+sj-make-raw-frontend --like runs/x/lambda-0/seed-42/checkpoints/latest.pt --output runs/x-frontends/raw.pt
 ```
 
 `sj-train-dense` は `--resume auto`（既定）で `OUTPUT/checkpoints/latest.pt` から再開します。
@@ -223,7 +225,7 @@ dead featureや「正なら発火」などの疎モデル用指標は密モデ�
 | `src/sae_jepa/sigreg.py` | 射影生成・Epps–Pulley損失・参照実装 |
 | `src/sae_jepa/config.py` | データ・モデル・SIGReg・最適化・評価の設定 |
 | `src/sae_jepa/train.py` | 学習ループ・勾配診断・checkpoint/再開 |
-| `src/sae_jepa/normalization.py` | train統計・PCA whitening |
+| `src/sae_jepa/normalization.py` | train統計・PCA whitening・Raw/PCA前段ファイル |
 | `src/sae_jepa/data.py` | manifest読み込み・split・再開可能なbatch iterator |
 | `src/sae_jepa/evaluate.py` | 密な表現専用の評価 |
 | `src/sae_jepa/reporting.py` | 集計レポート |

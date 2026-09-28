@@ -15,7 +15,7 @@ from .data import write_json
 from .evaluate import _autocast
 from .probe_data import (DATASETS, SPLITS, checkpoint_info, collect, file_hash,
                          prepare, read_tasks, text_id)
-from .stage2 import FORMAT, build_front, config, tensor_hash
+from .stage2 import FORMAT, build_front, comparable_config, config, front_info, run_label, tensor_hash
 from .topk import TopKSAE
 
 
@@ -99,7 +99,7 @@ def pooled_features(state, cache, device, token_batch_size):
     cfg = config(state['config'])
     front = build_front(state['frontend'], device)
     with torch.random.fork_rng(devices=[]):
-        sae = TopKSAE(front.cfg.d_latent, cfg.dictionary_size, cfg.k)
+        sae = TopKSAE(front.d_out, cfg.dictionary_size, cfg.k)
     sae.load_state_dict(state['sae']); sae.to(device).eval().requires_grad_(False)
     mean = state['calibration']['mean'].to(device)
     scale = state['calibration']['scale']
@@ -170,7 +170,8 @@ def evaluate_checkpoints(args):
     for i, path in enumerate(args.checkpoints):
         print(f"Probing checkpoint {i+1}/{len(args.checkpoints)}: {path}", flush=True)
         state = torch.load(path, map_location='cpu', weights_only=False, mmap=True)
-        comparison = (state['config'], state['step'], state['initial_sha256'])
+        # Front-end and loss space may differ; budget, seed, dictionary and K may not.
+        comparison = (comparable_config(state['config']), state['step'], state['initial_sha256'])
         if baseline is not None and comparison != baseline:
             raise ValueError("stage-2 settings, steps or initialization differ across candidates")
         baseline = comparison
@@ -179,7 +180,7 @@ def evaluate_checkpoints(args):
         features = pooled_features(state, cache, torch.device(args.device), args.token_batch_size)
         result = {"checkpoint": path, "sae_sha256": tensor_hash(state['sae']),
             "frontend_sha256": tensor_hash(state['frontend']['model']),
-            "frontend_lambda": state['frontend']['config']['sigreg']['weight'],
+            **front_info(state['frontend']), "loss_space": state['config'].get('loss_space', 'latent'),
             "step": state['step'], "tasks": {}}
         for task, items in sorted(grouped.items()):
             result['tasks'][task] = {"dataset": items[0]['dataset'],
@@ -196,12 +197,12 @@ def evaluate_checkpoints(args):
         "models": summary})
     lines = ['# Sparse probing (primary metric: Top-1)', '',
              'Validation selects C. Test is evaluated only with --include-test. No test-based feature selection.', '',
-             '| Model | lambda | split | probe features | Dataset macro accuracy | Task macro accuracy |',
-             '|---|---:|---|---:|---:|---:|']
+             '| Model | front-end / loss | split | probe features | Dataset macro accuracy | Task macro accuracy |',
+             '|---|---|---|---:|---:|---:|']
     for i, result in enumerate(summary):
         for split, scores in result['aggregate'].items():
             for k, r in scores.items():
-                lines.append(f"| {i:02d} | {result['frontend_lambda']:g} | {split} | {k} | "
+                lines.append(f"| {i:02d} | {run_label(result)} | {split} | {k} | "
                              f"{r['dataset_macro_accuracy']:.4f} | {r['task_macro_accuracy']:.4f} |")
     (output / 'summary.md').write_text('\n'.join(lines) + '\n', encoding='utf-8')
 

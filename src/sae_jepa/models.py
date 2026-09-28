@@ -44,6 +44,11 @@ class DenseSIGRegAE(nn.Module):
         )
         self.decoder = nn.Linear(cfg.d_latent, cfg.d_in)
 
+    @property
+    def d_out(self) -> int:
+        """Width of the dense representation handed to stage 2."""
+        return self.cfg.d_latent
+
     def normalize(self, h: torch.Tensor) -> torch.Tensor:
         return (h.float() - self.input_mean) / self.input_scale
 

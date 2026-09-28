@@ -542,6 +542,7 @@ def eval_batches(
     seed: int = 0,
     chunk_batches: int = 16,
     with_metadata: bool = False,
+    allow_train: bool = False,
 ) -> Iterator[Any]:
     """Fixed, shuffled evaluation batches drawn from the whole held-out split.
 
@@ -559,8 +560,12 @@ def eval_batches(
     With ``with_metadata`` each item is ``(rows, meta)`` where ``meta`` holds
     ``entry`` (index into ``source.paths(split)``), ``sequence`` (index within
     the shard file) and ``position`` (token position within that sequence).
+
+    ``allow_train`` permits the same uniform without-replacement sample from the
+    train split, for fitting train-only statistics (e.g. PCA whitening); it is
+    never used for evaluation.
     """
-    if split == "train":
+    if split == "train" and not allow_train:
         raise ValueError("evaluation batches are only drawn from held-out splits")
     entries = source.paths(split)
     if not entries:

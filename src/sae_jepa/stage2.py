@@ -1,8 +1,20 @@
-"""Frozen dense front-end -> Top-K SAE pilot training, evaluation and comparison."""
+"""Frozen front-end -> Top-K SAE pilot training, evaluation and comparison.
+
+Front-ends are stage-1 dense checkpoints or ``sae-jepa-frontend-v1`` files
+(raw / PCA whitening, see :mod:`sae_jepa.frontends`).  ``loss_space`` selects
+where the SAE reconstruction loss is measured:
+
+    latent    mean((u_hat - u)^2)                 u = calibrated front-end output
+    original  mean((D(s_y u_hat + mu_y) - x)^2)   x = (h - mu)/s, D = frozen decoder
+
+``original`` back-propagates through the frozen linear decoder, so for PCA it is
+the dewhitened loss of the whitening paper and for the raw front-end it equals
+``latent`` up to the calibration scale.
+"""
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import hashlib
 import json
 import math
@@ -13,14 +25,19 @@ import torch
 import yaml
 
 from .config import _update, config_from_dict, parse_override
-from .data import DataSource, TrainBatches, eval_batches, write_json
-from .evaluate import _autocast, load_checkpoint_model
-from .models import build_model
-from .normalization import check_normalization_matches
+from .data import DataSource, TrainBatches, eval_batches, torch_load, write_json
+from .evaluate import _autocast
+from .frontends import LinearFrontend, linear_frontend_from_file
+from .models import ARCHITECTURE_ID, build_model
+from .normalization import FRONTEND_FORMAT, check_normalization_matches
 from .topk import TopKSAE
 from .train import lr_multiplier
 
 FORMAT = "sae-jepa-topk-checkpoint-v1"
+LOSS_SPACES = ("latent", "original")
+# Settings that may differ between compared stage-2 runs (everything else,
+# including budget, seed and dictionary, must match).
+COMPARISON_FREE_KEYS = ("loss_space",)
 
 
 @dataclass
@@ -47,6 +64,8 @@ class Stage2Config:
     log_every: int = 100
     checkpoint_every: int = 1000
     required_splits: tuple[str, ...] = ("validation",)
+    # Checkpoints written before this option existed trained in the latent space.
+    loss_space: str = "latent"
 
     def validate(self):
         for key in ["dictionary_size", "k", "steps", "batch_size", "shards_per_window",
@@ -67,6 +86,8 @@ class Stage2Config:
             raise ValueError("weight_decay and gradient_clip must be finite and nonnegative")
         if not self.required_splits or any(s not in {"validation", "test"} for s in self.required_splits):
             raise ValueError("required_splits must contain validation and/or test")
+        if self.loss_space not in LOSS_SPACES:
+            raise ValueError(f"loss_space must be one of {LOSS_SPACES}")
 
 
 def config(values=None, overrides=()):
@@ -87,8 +108,39 @@ def tensor_hash(state):
     return digest.hexdigest()
 
 
+def comparable_config(values):
+    """Stage-2 settings that compared runs must share."""
+    return {k: v for k, v in dict(values).items() if k not in COMPARISON_FREE_KEYS}
+
+
+def front_kind(front):
+    """``dense`` for stage-1 checkpoints (including ones saved before kinds existed)."""
+    return front.get("kind", "dense")
+
+
+def front_info(front):
+    """Front-end description stored with every evaluation and probe result."""
+    kind = front_kind(front)
+    weight = front["config"]["sigreg"]["weight"] if kind == "dense" else None
+    if kind == "dense":
+        label = f"dense λ={weight:g}"
+    elif kind == "pca":
+        label = f"pca ε={front['epsilon']:.2g}"
+    else:
+        label = kind
+    return {"frontend_kind": kind, "frontend_label": label, "frontend_lambda": weight}
+
+
+def run_label(result):
+    """Front-end label and loss space of a stage-2 evaluation/probe record."""
+    label = result.get("frontend_label")
+    if label is None:
+        label = f"dense λ={result['frontend_lambda']:g}"
+    return f"{label} / {result.get('loss_space', 'latent')}"
+
+
 def source_for(front, manifest=None):
-    data = front["config"]["data"]
+    data = front.get("data") or front["config"]["data"]
     source = DataSource(manifest or data["activation_manifest"],
         skip_burn_in=data.get("skip_burn_in", True),
         skip_leading_positions=data.get("skip_leading_positions", 0),
@@ -101,16 +153,33 @@ def source_for(front, manifest=None):
 
 
 def load_front(path):
-    with torch.random.fork_rng(devices=[]):
-        model, state = load_checkpoint_model(path, torch.device("cpu"))
-    front = {k: state[k] for k in ["config", "data_manifest", "normalization", "model", "step"]}
+    """Frozen front-end module and the record stored in stage-2 checkpoints."""
+    state = torch_load(path)
+    if state.get("format") == FRONTEND_FORMAT:
+        model = linear_frontend_from_file(state)
+        front = {"kind": state["kind"], "config": None, "data": state["data"],
+                 "data_manifest": state["data_manifest"], "normalization": state["normalization"],
+                 "model": model.state_dict(), "step": None}
+        if state["kind"] == "pca":
+            pca = state["pca"]
+            front.update({"epsilon": pca["epsilon"], "pca_sampling": pca.get("sampling"),
+                          "pca_diagnostics": pca.get("diagnostics")})
+    elif state.get("architecture_id") == ARCHITECTURE_ID:
+        front = {k: state[k] for k in ["config", "data_manifest", "normalization", "model", "step"]}
+        front["kind"] = "dense"
+        model = build_front(front, torch.device("cpu"))
+    else:
+        raise ValueError(f"{path} is neither a stage-1 dense checkpoint nor a front-end file")
     front["path"] = str(path)
     front["sha256"] = tensor_hash(front["model"])
     del state
-    return model, front
+    return model.eval().requires_grad_(False), front
 
 
 def build_front(front, device):
+    if front_kind(front) != "dense":
+        model = LinearFrontend.from_state_dict(front["model"], front_kind(front))
+        return model.to(device).eval().requires_grad_(False)
     cfg = config_from_dict(front["config"])
     with torch.random.fork_rng(devices=[]):
         model = build_model(cfg.model, front["normalization"]["mean"], front["normalization"]["scale"])
@@ -130,7 +199,7 @@ def check_splits(source, cfg):
 def calibrate(frontend, source, cfg, device):
     """Train-only sampled mean and scalar RMS, preserving latent anisotropy."""
     batches = TrainBatches(source, cfg.batch_size, cfg.calibration_seed, cfg.shards_per_window)
-    total = torch.zeros(frontend.cfg.d_latent, dtype=torch.float64, device=device)
+    total = torch.zeros(frontend.d_out, dtype=torch.float64, device=device)
     total_sq = torch.zeros_like(total)
     count = 0
     for _ in range(cfg.calibration_batches):
@@ -176,7 +245,7 @@ def evaluate(frontend, sae, calibration, source, cfg, device, split="validation"
     scale = calibration["scale"]
     moments = {"frontend": ReconstructionMoments(source.d_in, device),
                "end_to_end": ReconstructionMoments(source.d_in, device),
-               "latent": ReconstructionMoments(frontend.cfg.d_latent, device)}
+               "latent": ReconstructionMoments(frontend.d_out, device)}
     counts = torch.zeros(cfg.dictionary_size, dtype=torch.long, device=device)
     n, l0_total, l0_min, l0_max = 0, 0, cfg.k, 0
     sample_identity = {"fingerprint": source.fingerprint, "split": split,
@@ -246,7 +315,7 @@ class Stage2Trainer:
         self.calibration = saved["calibration"] if saved else calibrate(self.frontend, self.source, cfg, self.device)
         with torch.random.fork_rng(devices=[]):
             torch.random.default_generator.manual_seed(cfg.seed)
-            self.sae = TopKSAE(self.frontend.cfg.d_latent, cfg.dictionary_size, cfg.k).to(self.device)
+            self.sae = TopKSAE(self.frontend.d_out, cfg.dictionary_size, cfg.k).to(self.device)
         self.initial_sha256 = tensor_hash(self.sae.state_dict())
         self.optimizer = torch.optim.AdamW(self.sae.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
         self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer,
@@ -287,13 +356,21 @@ class Stage2Trainer:
         cfg = self.cfg
         self.sae.train()
         h = next(self.data).to(self.device)
+        scale = self.calibration["scale"]
         with torch.no_grad(), _autocast(self.device, cfg.amp_dtype):
             y = self.frontend.encode_dense(h).float()
-            u = (y - self.mean) / self.calibration["scale"]
+            u = (y - self.mean) / scale
+            if cfg.loss_space == "original":
+                x = self.frontend.normalize(h).float()
         self.optimizer.zero_grad(set_to_none=True)
         with _autocast(self.device, cfg.amp_dtype):
             prediction, z = self.sae(u)
-            loss = (prediction.float() - u).square().mean()
+            if cfg.loss_space == "latent":
+                loss = (prediction.float() - u).square().mean()
+            else:
+                # Gradients pass through the frozen (requires_grad=False) decoder.
+                x_hat = self.frontend.decode_normalized(prediction.float() * scale + self.mean)
+                loss = (x_hat.float() - x).square().mean()
         if not torch.isfinite(loss):
             raise ValueError("nonfinite stage-2 training loss")
         loss.backward()
@@ -305,7 +382,9 @@ class Stage2Trainer:
         with torch.no_grad():
             active = z > 0
             self.firing_counts += active.sum(0)
-        return {"normalized_latent_mse": float(loss.detach()), "lr": lr, "gradient_norm": float(norm),
+        loss_name = "normalized_latent_mse" if cfg.loss_space == "latent" else "normalized_input_mse"
+        return {"loss": float(loss.detach()), loss_name: float(loss.detach()),
+                "lr": lr, "gradient_norm": float(norm),
                 "l0_mean": float(active.sum(1).float().mean()),
                 "never_fired_fraction": float((self.firing_counts == 0).float().mean())}
 
@@ -334,7 +413,7 @@ class Stage2Trainer:
                 if self.step == 1 or self.step % self.cfg.log_every == 0 or self.step == stop:
                     row["train"] = metrics
                     row["elapsed_seconds"] = time.time() - started
-                    print(f"step {self.step}: loss={metrics['normalized_latent_mse']:.5f} L0={metrics['l0_mean']:.1f}", flush=True)
+                    print(f"step {self.step}: loss={metrics['loss']:.5f} L0={metrics['l0_mean']:.1f}", flush=True)
                 if self.cfg.validation_every and (self.step % self.cfg.validation_every == 0):
                     row["validation"] = evaluate(self.frontend, self.sae, self.calibration,
                         self.source, self.cfg, self.device, batches=self.cfg.validation_batches)
@@ -347,12 +426,16 @@ class Stage2Trainer:
         if self.step == self.cfg.steps:
             for split in self.cfg.required_splits:
                 results = evaluate(self.frontend, self.sae, self.calibration, self.source, self.cfg, self.device, split)
-                results.update({"step": self.step, "frontend_lambda": self.front["config"]["sigreg"]["weight"],
-                    "frontend_sha256": self.front["sha256"], "stage2_config": asdict(self.cfg),
-                    "initial_sae_sha256": self.initial_sha256,
-                    "train_positions": self.step * self.cfg.batch_size,
-                    "train_never_fired_fraction": float((self.firing_counts == 0).float().mean())})
+                results.update(result_metadata(self.front, self.cfg, self.step, self.initial_sha256,
+                                               self.firing_counts))
                 write_json(self.output / f"eval-{split}.json", results)
+
+
+def result_metadata(front, cfg, step, initial_sha256, firing_counts):
+    return {"step": step, **front_info(front), "loss_space": cfg.loss_space,
+            "frontend_sha256": front["sha256"], "stage2_config": asdict(cfg),
+            "initial_sae_sha256": initial_sha256, "train_positions": step * cfg.batch_size,
+            "train_never_fired_fraction": float((firing_counts == 0).float().mean())}
 
 
 def preflight(checkpoints, cfg, manifest=None):
@@ -364,13 +447,18 @@ def preflight(checkpoints, cfg, manifest=None):
         source = source_for(front, manifest)
         check_splits(source, cfg)
         identity = {k: source.record()[k] for k in ["fingerprint", "splits", "burn_in_excluded"]}
-        identity["model"] = asdict(model.cfg)
+        # Equal widths also give every candidate the same initial SAE.
+        identity["d_out"] = model.d_out
         identity["normalization"] = tensor_hash({"mean": model.input_mean, "scale": model.input_scale.reshape(1)})
         if baseline is not None and identity != baseline:
             raise ValueError("comparison candidates differ in data, exclusions, dimensions or input normalization")
         baseline = identity
-        rows.append({"path": str(path), "lambda": front["config"]["sigreg"]["weight"],
-                     "step": front["step"], "sha256": front["sha256"]})
+        info = front_info(front)
+        row = {"path": str(path), "lambda": info["frontend_lambda"], "step": front["step"],
+               "sha256": front["sha256"]}
+        if info["frontend_kind"] != "dense":
+            row["kind"] = info["frontend_kind"]
+        rows.append(row)
     if len({r["sha256"] for r in rows}) != len(rows):
         raise ValueError("duplicate front-end checkpoint in comparison")
     return rows
@@ -386,27 +474,30 @@ def write_report(root, split="validation"):
         raise ValueError(f"no {split} evaluations found")
     rows = [json.loads(p.read_text(encoding="utf-8")) for p in paths]
     for r in rows[1:]:
-        if any(r[k] != rows[0][k] for k in ["sample_sha256", "stage2_config", "initial_sae_sha256", "step"]):
+        if (any(r[k] != rows[0][k] for k in ["sample_sha256", "initial_sae_sha256", "step"])
+                or comparable_config(r["stage2_config"]) != comparable_config(rows[0]["stage2_config"])):
             raise ValueError("refusing report: evaluations do not share sampling, initialization and training budget")
     lines = [f"# Stage 2 ({split})", "", "FVU is in original activation space; latent FVU is reported separately.",
-             "Inactive means no positive activation on this evaluation sample, not permanently dead.", "",
-             "| Run | λ | Frontend FVU (%) | End-to-end FVU (%) | Extra FVU (pp) | Latent FVU (%) | Mean L0 | Inactive (%) | Never fired in training (%) |",
-             "|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
+             "Inactive means no positive activation on this evaluation sample, not permanently dead.",
+             "Loss: latent = SAE-input MSE; original = MSE after the frozen front-end decoder.", "",
+             "| Run | Front-end | Loss | Frontend FVU (%) | End-to-end FVU (%) | Extra FVU (pp) | Latent FVU (%) | Mean L0 | Inactive (%) | Never fired in training (%) |",
+             "|---|---|---|---:|---:|---:|---:|---:|---:|---:|"]
     compact = []
     for p, r in zip(paths, rows):
         compact.append({k: v for k, v in r.items() if k != "feature_firing_counts"})
-        lines.append(f"| {p.parent.name} | {r['frontend_lambda']:g} | {r['frontend']['fvu']*100:.4f} | "
+        label = r.get("frontend_label") or f"dense λ={r['frontend_lambda']:g}"
+        lines.append(f"| {p.parent.name} | {label} | {r.get('loss_space', 'latent')} | {r['frontend']['fvu']*100:.4f} | "
                      f"{r['end_to_end']['fvu']*100:.4f} | {r['extra_fvu']*100:.4f} | "
                      f"{r['latent']['fvu']*100:.4f} | {r['l0_mean']:.2f} | {r['inactive_fraction']*100:.2f} | "
                      f"{r['train_never_fired_fraction']*100:.2f} |")
     report = root / "report"; report.mkdir(exist_ok=True)
     (report / f"{split}.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     write_json(report / f"{split}.json", compact)
-    fig, ax = plt.subplots(figsize=(7, 4))
+    fig, ax = plt.subplots(figsize=(max(7, 1.4 * len(rows)), 4))
     x = list(range(len(rows)))
     ax.bar([v - .18 for v in x], [r['frontend']['fvu']*100 for r in rows], width=.36, label="Frontend only")
     ax.bar([v + .18 for v in x], [r['end_to_end']['fvu']*100 for r in rows], width=.36, label="Frontend + Top-K SAE")
-    ax.set_xticks(x, [f"lambda={r['frontend_lambda']:g}" for r in rows])
+    ax.set_xticks(x, [run_label(r).replace(" / ", "\n") for r in rows], fontsize=8)
     ax.set_ylabel("Original-space FVU (%)"); ax.legend(); fig.tight_layout()
     fig.savefig(report / f"{split}.png", dpi=160); plt.close(fig)
 
@@ -423,6 +514,10 @@ def main(argv=None):
         p.add_argument("--activation-manifest")
         p.add_argument("--device", default="cuda")
         p.add_argument("--resume", action="store_true")
+        if name == "sweep":
+            p.add_argument("--loss-spaces", nargs="+", choices=LOSS_SPACES,
+                           help="train every front-end with each loss space (default: config loss_space); "
+                                "runs are numbered front-end-major")
     p = sub.add_parser("evaluate")
     p.add_argument("--checkpoint", required=True); p.add_argument("--output", required=True)
     p.add_argument("--device", default="cuda"); p.add_argument("--activation-manifest")
@@ -441,13 +536,11 @@ def main(argv=None):
         front = build_front(state["frontend"], device)
         source = source_for(state["frontend"], args.activation_manifest)
         with torch.random.fork_rng(devices=[]):
-            sae = TopKSAE(front.cfg.d_latent, cfg.dictionary_size, cfg.k).to(device)
+            sae = TopKSAE(front.d_out, cfg.dictionary_size, cfg.k).to(device)
         sae.load_state_dict(state["sae"])
         results = evaluate(front, sae, state["calibration"], source, cfg, device, args.split)
-        results.update({"step": state["step"], "frontend_lambda": state["frontend"]["config"]["sigreg"]["weight"],
-                        "frontend_sha256": state["frontend"]["sha256"], "stage2_config": asdict(cfg),
-                        "initial_sae_sha256": state["initial_sha256"], "train_positions": state["step"] * cfg.batch_size,
-                        "train_never_fired_fraction": float((state["firing_counts"] == 0).float().mean())})
+        results.update(result_metadata(state["frontend"], cfg, state["step"], state["initial_sha256"],
+                                       state["firing_counts"]))
         return write_json(Path(args.output), results)
     values = yaml.safe_load(Path(args.config).read_text(encoding="utf-8")) if args.config else {}
     cfg = config(values, args.set)
@@ -458,6 +551,13 @@ def main(argv=None):
         return Stage2Trainer(args.checkpoints[0], args.output, cfg, args.device, args.activation_manifest, args.resume).run()
     root = Path(args.output)
     definition = {"candidates": candidates, "config": asdict(cfg)}
+    runs = [(checkpoint, cfg) for checkpoint in args.checkpoints]
+    if args.loss_spaces:
+        if len(set(args.loss_spaces)) != len(args.loss_spaces):
+            raise ValueError("duplicate loss space")
+        definition["loss_spaces"] = list(args.loss_spaces)
+        runs = [(checkpoint, replace(cfg, loss_space=space))
+                for checkpoint in args.checkpoints for space in args.loss_spaces]
     # JSON round-trip normalizes tuple/list representation.
     definition = json.loads(json.dumps(definition))
     if root.exists() and any(root.iterdir()):
@@ -467,10 +567,10 @@ def main(argv=None):
             raise ValueError("comparison candidates or settings changed")
     root.mkdir(parents=True, exist_ok=True)
     write_json(root / "comparison.json", definition)
-    for i, checkpoint in enumerate(args.checkpoints):
+    for i, (checkpoint, run_cfg) in enumerate(runs):
         output = root / f"model-{i:02d}"
         resume = args.resume and (output / "checkpoints/latest.pt").exists()
-        Stage2Trainer(checkpoint, output, cfg, args.device, args.activation_manifest, resume).run()
+        Stage2Trainer(checkpoint, output, run_cfg, args.device, args.activation_manifest, resume).run()
     for split in cfg.required_splits:
         write_report(root, split)
 

@@ -6,24 +6,27 @@ mean vector and ``s`` is one scalar shared by all coordinates:
     s^2 = E_train ||h - mu||_2^2 / d
 
 Only mean and overall scale are removed; correlations and the per-coordinate
-variance profile are left for the encoder.  PCA whitening is provided as a
-separate comparison front-end (``sj-fit-pca``), never inside the dense model.
+variance profile are left for the encoder.  PCA whitening (``sj-fit-pca``) and
+the raw input (``sj-make-raw-frontend``) are separate stage-2 comparison
+front-ends, never inside the dense model.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 from typing import Any
 
 import torch
 from tqdm import tqdm
 
-from .data import DataSource, parse_entry, torch_load
+from .data import DataSource, eval_batches, parse_entry, torch_load
 
 
 NORMALIZATION_FORMAT = "sae-jepa-normalization-v1"
 PCA_FORMAT = "sae-jepa-pca-whitening-v1"
+FRONTEND_FORMAT = "sae-jepa-frontend-v1"
 
 
 @torch.no_grad()
@@ -116,48 +119,162 @@ def denormalize(x: torch.Tensor, mean: torch.Tensor, scale: float | torch.Tensor
     return x * scale + mean
 
 
+def resolve_pca_epsilon(eigenvalues: torch.Tensor, epsilon: float | None, relative_epsilon: float) -> float:
+    """Absolute ``epsilon`` if given, else ``relative_epsilon`` x mean eigenvalue.
+
+    ``x`` has mean squared norm ``d`` per token, so the mean eigenvalue is about 1
+    and an absolute 1e-6 would amplify the weakest directions ~1000x.
+    """
+    if epsilon is not None:
+        if not epsilon > 0:
+            raise ValueError("epsilon must be positive")
+        return float(epsilon)
+    if not relative_epsilon > 0:
+        raise ValueError("relative_epsilon must be positive")
+    return float(relative_epsilon * eigenvalues.clamp_min(0).mean())
+
+
+def _sorted_eigh(covariance: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    eigenvalues, eigenvectors = torch.linalg.eigh(covariance)
+    order = torch.argsort(eigenvalues, descending=True)
+    return eigenvalues[order], eigenvectors[:, order]
+
+
+def pca_diagnostics(
+    eigenvalues: torch.Tensor,
+    epsilon: float,
+    halves: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ks: tuple[int, ...] = (1, 4, 16, 64, 256, 1024),
+) -> dict[str, Any]:
+    """Spectrum summary and split-half stability of the leading subspaces.
+
+    ``subspace_overlap[k] = ||U_a[:, :k]^T U_b[:, :k]||_F^2 / k`` (1 = identical
+    top-k subspaces in the two halves, ~k/d for unrelated ones).
+    """
+    lam = eigenvalues.double().clamp_min(0)
+    total = float(lam.sum())
+    d = lam.numel()
+    ks = tuple(k for k in ks if k <= d)
+    gain = (lam + epsilon).rsqrt()
+    result = {
+        "epsilon": epsilon,
+        "trace": total,
+        "participation_ratio": total**2 / max(float(lam.square().sum()), 1e-300),
+        "largest_eigenvalue": float(lam[0]),
+        "smallest_eigenvalue": float(lam[-1]),
+        "condition_number": float((lam[0] + epsilon) / (lam[-1] + epsilon)),
+        "maximum_whitening_gain": float(gain.max()),
+        "eigenvalues_below_epsilon": int((lam < epsilon).sum()),
+        "cumulative_variance": {str(k): float(lam[:k].sum()) / max(total, 1e-300) for k in ks},
+        # Mean over whitened coordinates of the share of their unit variance
+        # that is signal rather than the epsilon floor.
+        "mean_signal_fraction": float((lam / (lam + epsilon)).mean()),
+    }
+    if halves is not None:
+        (_, vectors_a), (_, vectors_b) = (_sorted_eigh(c) for c in halves)
+        result["subspace_overlap"] = {
+            str(k): float((vectors_a[:, :k].T @ vectors_b[:, :k]).square().sum()) / k for k in ks
+        }
+    return result
+
+
 @torch.no_grad()
 def fit_pca_whitening(
     source: DataSource,
     stats: dict[str, Any],
-    epsilon: float = 1e-6,
+    epsilon: float | None = None,
     maximum_positions: int = 0,
     progress: bool = False,
+    relative_epsilon: float = 1e-3,
+    sample_seed: int = 92001,
+    batch_size: int = 4096,
+    device: str | torch.device = "cpu",
 ) -> dict[str, Any]:
-    """PCA whitening of ``x = (h - mu)/s`` fitted on train positions only."""
+    """PCA whitening of ``x = (h - mu)/s`` fitted on train positions only.
+
+    ``maximum_positions > 0`` draws that many positions (rounded down to whole
+    batches) uniformly without replacement from the whole train split with
+    ``sample_seed``; 0 uses every train position.  The second moment about the
+    train mean ``mu`` is accumulated in float64, and two halves (alternating
+    batches / shards) are kept for a split-half stability check.  ``epsilon``
+    is absolute when given, otherwise ``relative_epsilon`` x mean eigenvalue.
+    """
     check_normalization_matches(stats, source)
-    mean = stats["mean"].double()
+    device = torch.device(device)
+    mean = stats["mean"].double().to(device)
     scale = float(stats["scale"])
     d = mean.numel()
-    second = torch.zeros(d, d, dtype=torch.float64)
-    count = 0
-    for path in tqdm(source.paths("train"), desc="PCA covariance", disable=not progress):
-        x = (source.positions(path).double() - mean) / scale
-        if maximum_positions > 0:
-            x = x[: max(0, maximum_positions - count)]
-        second += x.T @ x
-        count += len(x)
-        if maximum_positions > 0 and count >= maximum_positions:
-            break
-    covariance = second / max(count, 1)
-    eigenvalues, eigenvectors = torch.linalg.eigh(covariance)
-    order = torch.argsort(eigenvalues, descending=True)
+    halves = [torch.zeros(d, d, dtype=torch.float64, device=device) for _ in range(2)]
+    counts = [0, 0]
+    if maximum_positions > 0:
+        n_batches = maximum_positions // batch_size
+        if n_batches < 2:
+            raise ValueError("maximum_positions must cover at least two batches")
+        chunks = eval_batches(source, "train", batch_size, n_batches, seed=sample_seed,
+                              allow_train=True)
+        total = n_batches
+    else:
+        chunks = (source.positions(path) for path in source.paths("train"))
+        total = len(source.paths("train"))
+    for index, rows in enumerate(tqdm(chunks, total=total, desc="PCA covariance", disable=not progress)):
+        x = (rows.to(device).double() - mean) / scale
+        halves[index % 2] += x.T @ x
+        counts[index % 2] += len(x)
+    count = sum(counts)
+    if min(counts) < 1:
+        raise ValueError("PCA needs train positions in both halves")
+    covariance = (halves[0] + halves[1]) / count
+    eigenvalues, eigenvectors = _sorted_eigh(covariance)
+    epsilon = resolve_pca_epsilon(eigenvalues, epsilon, relative_epsilon)
+    diagnostics = pca_diagnostics(
+        eigenvalues, epsilon, (halves[0] / counts[0], halves[1] / counts[1])
+    )
+    diagnostics.update({"count": count, "half_counts": counts})
     return {
         "format": PCA_FORMAT,
         "mean": stats["mean"],
         "scale": scale,
-        "eigenvalues": eigenvalues[order].float(),
-        "eigenvectors": eigenvectors[:, order].float(),
-        "epsilon": float(epsilon),
+        "eigenvalues": eigenvalues.float().cpu(),
+        "eigenvectors": eigenvectors.float().cpu(),
+        "epsilon": epsilon,
         "count": int(count),
+        "sampling": {"maximum_positions": maximum_positions, "seed": sample_seed,
+                     "batch_size": batch_size,
+                     "method": "uniform without replacement over the train split"
+                               if maximum_positions > 0 else "all train positions"},
+        "diagnostics": diagnostics,
         "manifest_fingerprint": source.fingerprint,
         "shards": list(source.splits["train"]),
+        "burn_in_excluded": source.burn_in,
         "convention": "y = U^T x / sqrt(lambda + epsilon), x = (h - mu)/s",
     }
 
 
-def _source_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--activation-manifest", required=True)
+def data_policy(source: DataSource, test_split: str, holdout_test_fraction: float,
+                skip_burn_in: bool) -> dict[str, Any]:
+    """The ``config.data`` subset stage 2 needs to rebuild the same DataSource."""
+    return {"activation_manifest": str(source.manifest_path), "skip_burn_in": skip_burn_in,
+            "skip_leading_positions": source.skip_leading_positions, "test_split": test_split,
+            "holdout_test_fraction": holdout_test_fraction}
+
+
+def make_frontend_file(kind: str, source: DataSource, stats: dict[str, Any],
+                       policy: dict[str, Any], pca: dict[str, Any] | None = None) -> dict[str, Any]:
+    """A raw / PCA stage-2 front-end with its data policy and statistics."""
+    if kind not in {"raw", "pca"} or (kind == "pca") != (pca is not None):
+        raise ValueError("front-end files are raw (no PCA) or pca (with PCA)")
+    check_normalization_matches(stats, source)
+    keys = ["mean", "scale", "count", "shards", "burn_in_excluded", "manifest_fingerprint"]
+    state = {"format": FRONTEND_FORMAT, "kind": kind, "data": policy,
+             "data_manifest": source.record(),
+             "normalization": {key: stats[key] for key in keys if key in stats}}
+    if pca is not None:
+        state["pca"] = pca
+    return state
+
+
+def _source_arguments(parser: argparse.ArgumentParser, required: bool = True) -> None:
+    parser.add_argument("--activation-manifest", required=required)
     parser.add_argument("--no-skip-burn-in", action="store_true")
     parser.add_argument(
         "--skip-leading-positions",
@@ -180,6 +297,55 @@ def _source(args: argparse.Namespace) -> DataSource:
     )
 
 
+def _frontend_arguments(parser: argparse.ArgumentParser) -> None:
+    _source_arguments(parser, required=False)
+    parser.add_argument(
+        "--like",
+        help="stage-1 dense checkpoint whose data policy and normalization statistics "
+        "to copy (recommended: guarantees identical inputs across stage-2 candidates); "
+        "--activation-manifest then only overrides a moved manifest path",
+    )
+    parser.add_argument("--normalization", help="sj-compute-normalization output (without --like)")
+    parser.add_argument("--output", required=True)
+
+
+def frontend_inputs_like(checkpoint: str | Path, manifest: str | None = None
+                         ) -> tuple[DataSource, dict[str, Any], dict[str, Any]]:
+    """Data source, statistics and data policy copied from a stage-1 checkpoint."""
+    state = torch_load(checkpoint)
+    data = dict(state["config"]["data"])
+    if manifest:
+        data["activation_manifest"] = manifest
+    source = DataSource(data["activation_manifest"], skip_burn_in=data.get("skip_burn_in", True),
+                        skip_leading_positions=data.get("skip_leading_positions", 0),
+                        test_split=data.get("test_split", "auto"),
+                        holdout_test_fraction=data.get("holdout_test_fraction", 0.5))
+    record = source.record()
+    if any(record[k] != state["data_manifest"][k] for k in ["fingerprint", "splits", "burn_in_excluded"]):
+        raise ValueError("--like checkpoint data identity, splits or exclusions differ from the manifest")
+    stats = state["normalization"]
+    check_normalization_matches(stats, source)
+    policy = data_policy(source, data.get("test_split", "auto"),
+                         data.get("holdout_test_fraction", 0.5), data.get("skip_burn_in", True))
+    return source, stats, policy
+
+
+def _frontend_inputs(args: argparse.Namespace) -> tuple[DataSource, dict[str, Any], dict[str, Any]]:
+    if args.like:
+        return frontend_inputs_like(args.like, args.activation_manifest)
+    if not args.activation_manifest or not args.normalization:
+        raise SystemExit("give --like CHECKPOINT, or both --activation-manifest and --normalization")
+    source = _source(args)
+    stats = load_normalization(args.normalization, source)
+    policy = data_policy(source, args.test_split, args.holdout_test_fraction, not args.no_skip_burn_in)
+    return source, stats, policy
+
+
+def _refuse_overwrite(path: str | Path) -> None:
+    if Path(path).exists():
+        raise SystemExit(f"{path} exists; choose a new output")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Compute train-only mean and scalar scale")
     _source_arguments(parser)
@@ -190,18 +356,42 @@ def main() -> None:
     print(f"mean norm={stats['mean'].norm():.4f} scale={stats['scale']:.6f} n={stats['count']:,}")
 
 
-def pca_main() -> None:
-    parser = argparse.ArgumentParser(description="Fit train-only PCA whitening")
-    _source_arguments(parser)
-    parser.add_argument("--normalization", required=True)
-    parser.add_argument("--output", required=True)
-    parser.add_argument("--epsilon", type=float, default=1e-6)
-    parser.add_argument("--maximum-positions", type=int, default=0)
-    args = parser.parse_args()
-    source = _source(args)
-    stats = load_normalization(args.normalization, source)
-    pca = fit_pca_whitening(source, stats, args.epsilon, args.maximum_positions, progress=True)
-    save_normalization(pca, args.output)
+def pca_main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Fit a train-only PCA whitening stage-2 front-end")
+    _frontend_arguments(parser)
+    parser.add_argument("--epsilon", type=float, default=None,
+                        help="absolute eigenvalue floor (overrides --relative-epsilon)")
+    parser.add_argument("--relative-epsilon", type=float, default=1e-3,
+                        help="eigenvalue floor as a fraction of the mean eigenvalue")
+    parser.add_argument("--maximum-positions", type=int, default=2_097_152,
+                        help="uniformly sampled train positions (0 = every train position)")
+    parser.add_argument("--sample-seed", type=int, default=92001)
+    parser.add_argument("--batch-size", type=int, default=4096)
+    parser.add_argument("--device", default="cpu")
+    args = parser.parse_args(argv)
+    _refuse_overwrite(args.output)
+    source, stats, policy = _frontend_inputs(args)
+    pca = fit_pca_whitening(source, stats, args.epsilon, args.maximum_positions, progress=True,
+                            relative_epsilon=args.relative_epsilon, sample_seed=args.sample_seed,
+                            batch_size=args.batch_size, device=args.device)
+    save_normalization(make_frontend_file("pca", source, stats, policy, pca), args.output)
+    summary = Path(args.output).with_suffix(".json")
+    summary.write_text(json.dumps({"output": str(args.output), "data": policy,
+                                   "sampling": pca["sampling"], "diagnostics": pca["diagnostics"]},
+                                  indent=2), encoding="utf-8")
+    d = pca["diagnostics"]
+    print(f"PCA from {pca['count']:,} positions: epsilon={d['epsilon']:.3e} "
+          f"condition={d['condition_number']:.3e} max gain={d['maximum_whitening_gain']:.1f} "
+          f"participation ratio={d['participation_ratio']:.1f}; details in {summary}")
+
+
+def raw_main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Write a raw (x = (h - mu)/s) stage-2 front-end")
+    _frontend_arguments(parser)
+    args = parser.parse_args(argv)
+    _refuse_overwrite(args.output)
+    source, stats, policy = _frontend_inputs(args)
+    save_normalization(make_frontend_file("raw", source, stats, policy), args.output)
 
 
 if __name__ == "__main__":

@@ -21,3 +21,6 @@ validation_batches: 16
 log_every: 100
 checkpoint_every: 1000
 required_splits: [validation]
+# latent: MSE on the SAE input u; original: MSE on x = (h - mu)/s after the frozen
+# front-end decoder (PCA: dewhitened loss).  `sj-stage2 sweep --loss-spaces` overrides.
+loss_space: latent
