@@ -15,13 +15,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from pathlib import Path
 from typing import Any
 
 import torch
 from tqdm import tqdm
 
-from .data import DataSource, eval_batches, parse_entry, torch_load
+from .data import DataSource, parse_entry, torch_load
 
 
 NORMALIZATION_FORMAT = "sae-jepa-normalization-v1"
@@ -179,6 +180,46 @@ def pca_diagnostics(
 
 
 @torch.no_grad()
+def pca_train_chunks(source, maximum_positions, batch_size, sample_seed, progress=False):
+    """Read sampled train rows in shard/row order, retaining legacy half labels.
+
+    Keep randperm's exact sample for compatibility with existing experiments.
+    Only the I/O and summation order changes; do not reuse this for SIGReg
+    evaluation, which requires shuffled batches.
+    """
+    if batch_size < 1 or maximum_positions < 0:
+        raise ValueError("batch_size must be positive and maximum_positions nonnegative")
+    entries = source.paths("train")
+    counts = [int(source.sequence_counts(entry).sum()) for entry in entries]
+    if maximum_positions == 0:
+        # Bound GPU memory even when using the entire training set.
+        for index, (entry, count) in enumerate(zip(entries, counts)):
+            for start in range(0, count, batch_size):
+                rows = source.gather(entry, torch.arange(start, min(start + batch_size, count)))
+                yield rows, torch.full((len(rows),), index % 2, dtype=torch.long)
+        return
+    n_batches = min(sum(counts) // batch_size, maximum_positions // batch_size)
+    if n_batches < 2:
+        raise ValueError("maximum_positions and train split must cover at least two batches")
+    if progress:
+        print("PCA sampling: building legacy-compatible train permutation", flush=True)
+    order = torch.randperm(sum(counts), generator=torch.Generator().manual_seed(sample_seed))
+    # Clone releases the full-train backing storage after selection.
+    selected = order[:n_batches * batch_size].clone()
+    del order
+    selected, permutation = selected.sort()
+    half = (permutation // batch_size) % 2
+    del permutation
+    offset = 0
+    for entry, count in zip(entries, counts):
+        begin, end = torch.searchsorted(selected, torch.tensor([offset, offset + count])).tolist()
+        for start in range(begin, end, batch_size):
+            stop = min(start + batch_size, end)
+            yield source.gather(entry, selected[start:stop] - offset), half[start:stop]
+        offset += count
+
+
+@torch.no_grad()
 def fit_pca_whitening(
     source: DataSource,
     stats: dict[str, Any],
@@ -206,30 +247,61 @@ def fit_pca_whitening(
     d = mean.numel()
     halves = [torch.zeros(d, d, dtype=torch.float64, device=device) for _ in range(2)]
     counts = [0, 0]
+    chunks = pca_train_chunks(source, maximum_positions, batch_size, sample_seed, progress)
+    total = source.split_positions("train")
     if maximum_positions > 0:
-        n_batches = maximum_positions // batch_size
-        if n_batches < 2:
-            raise ValueError("maximum_positions must cover at least two batches")
-        chunks = eval_batches(source, "train", batch_size, n_batches, seed=sample_seed,
-                              allow_train=True)
-        total = n_batches
-    else:
-        chunks = (source.positions(path) for path in source.paths("train"))
-        total = len(source.paths("train"))
-    for index, rows in enumerate(tqdm(chunks, total=total, desc="PCA covariance", disable=not progress)):
-        x = (rows.to(device).double() - mean) / scale
-        halves[index % 2] += x.T @ x
-        counts[index % 2] += len(x)
+        total = min(total // batch_size, maximum_positions // batch_size) * batch_size
+    started = time.perf_counter()
+    read_seconds = compute_seconds = 0.0
+    def synchronize():
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+    with tqdm(total=total, desc="PCA covariance (ordered reads)", unit="tokens", disable=not progress) as bar:
+        iterator = iter(chunks)
+        while True:
+            tick = time.perf_counter()
+            try:
+                rows, half = next(iterator)
+            except StopIteration:
+                break
+            read_seconds += time.perf_counter() - tick
+            tick = time.perf_counter()
+            x = (rows.to(device).double() - mean) / scale
+            half = half.to(device)
+            for label in (0, 1):
+                part = x[half == label]
+                if len(part):
+                    halves[label].addmm_(part.T, part)
+                    counts[label] += len(part)
+            synchronize()
+            compute_seconds += time.perf_counter() - tick
+            bar.update(len(rows))
+            bar.set_postfix(read_s=round(read_seconds, 1), compute_s=round(compute_seconds, 1))
     count = sum(counts)
     if min(counts) < 1:
         raise ValueError("PCA needs train positions in both halves")
     covariance = (halves[0] + halves[1]) / count
+    if progress:
+        print("PCA eigendecomposition: full covariance (1/3)", flush=True)
+    synchronize()
+    tick = time.perf_counter()
     eigenvalues, eigenvectors = _sorted_eigh(covariance)
+    synchronize()
+    eigh_seconds = time.perf_counter() - tick
     epsilon = resolve_pca_epsilon(eigenvalues, epsilon, relative_epsilon)
+    if progress:
+        print("PCA diagnostics: two split-half eigendecompositions (2/3, 3/3)", flush=True)
+    tick = time.perf_counter()
     diagnostics = pca_diagnostics(
         eigenvalues, epsilon, (halves[0] / counts[0], halves[1] / counts[1])
     )
     diagnostics.update({"count": count, "half_counts": counts})
+    synchronize()
+    diagnostics["timing_seconds"] = {
+        "sampling_and_read": read_seconds, "covariance_compute": compute_seconds,
+        "full_eigh": eigh_seconds, "split_half_diagnostics": time.perf_counter() - tick,
+        "total": time.perf_counter() - started,
+    }
     return {
         "format": PCA_FORMAT,
         "mean": stats["mean"],
@@ -239,6 +311,7 @@ def fit_pca_whitening(
         "epsilon": epsilon,
         "count": int(count),
         "sampling": {"maximum_positions": maximum_positions, "seed": sample_seed,
+                     "read_order": "shard then ascending row; original half assignments preserved",
                      "batch_size": batch_size,
                      "method": "uniform without replacement over the train split"
                                if maximum_positions > 0 else "all train positions"},

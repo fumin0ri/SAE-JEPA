@@ -43,6 +43,26 @@ Rawの2条件は損失が定数倍（calibration尺度²）違うだけです。
 
 ## 実行
 
+### HDD上の活性ファイル
+
+PCA推定は、抽出済みのトークンをshardごと・行番号順にまとめて読みます。
+以前の16バッチごとに全shardを再訪する読み方を廃止しました。
+同じseed・推定数・batch sizeなら、抽出トークンとsplit-halfの所属は従来と同じです。
+積算順序の変更による浮動小数点の丸め差はあります。FP64の共分散計算は維持します。
+全件使用時もGPUへはbatch size以下で転送します。
+
+進捗はトークン数で表示し、`read_s`（抽出・読み込み）と`compute_s`
+（GPU転送・共分散積算）を分けます。共分散終了後には本体の固有値分解と
+split-half診断の開始を表示します。各段階の時間は`pca.json`の
+`diagnostics.timing_seconds`にも保存します。
+
+既存実験とのサンプル互換性のため、最初の全train `randperm`は残っています。
+選択後は小さいインデックス配列へコピーして全件分のメモリを解放しますが、
+抽出時の一時メモリはtrain件数に比例します。
+HDDでの実測速度は環境依存です。PCAの途中再開には対応していません。
+既存の`pca.pt`があるとsweepは再利用するため、再推定には新しい
+`FRONTEND_DIR`を指定してください。
+
 ```bash
 STAGE1_ROOT=runs/stage1-skip-lead-100k-v2 \
 RUN_ROOT=runs/stage2-whitening \
