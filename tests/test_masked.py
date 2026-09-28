@@ -122,3 +122,50 @@ def test_masked_config_requires_sigreg_and_dedicated_entrypoint(manifest, tmp_pa
     cfg.sigreg.weight = 0
     with pytest.raises(ValueError, match="sigreg.weight"):
         MaskedTrainer(cfg)
+
+
+def test_sigreg_only_has_no_mask_or_consistency_and_resumes(manifest, tmp_path, monkeypatch):
+    import sae_jepa.masked as module
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("SIGReg-only must not generate masked views")
+
+    monkeypatch.setattr(module, "mask_coordinates", forbidden)
+    cfg = config(manifest, tmp_path / "only")
+    cfg.masking.enabled = False
+    cfg.sigreg.weight = 1.0
+    trainer = MaskedTrainer(cfg)
+    h = next(trainer.data)
+    state = trainer.sigreg.state_dict()
+    expected = trainer.sigreg(trainer.model.encode_dense(h))
+    trainer.sigreg.load_state_dict(state)
+    mask_state = trainer.mask_generator.get_state()
+    loss, metrics = trainer.loss(h, True)
+    torch.testing.assert_close(loss, expected)
+    assert not any("consistency" in k or "masked" in k for k in metrics)
+    assert torch.equal(mask_state, trainer.mask_generator.get_state())
+    trainer.run(max_steps=4)
+    resumed = MaskedTrainer(cfg)
+    checkpoint = tmp_path / "only/checkpoints/latest.pt"
+    resumed.load_checkpoint(checkpoint)
+    trainer.run()
+    result = resumed.run()
+    assert result["objective"] == "sigreg_only"
+    assert not any("consistency" in k or k.startswith("masked/") for k in result)
+    for key, value in trainer.model.state_dict().items():
+        assert torch.equal(value, resumed.model.state_dict()[key])
+    output = tmp_path / "only/offline.json"
+    main(["evaluate", "--checkpoint", str(checkpoint), "--device", "cpu", "--output", str(output)])
+    assert json.loads(output.read_text())["gaussian/heldout_sigreg"] == result["gaussian/heldout_sigreg"]
+    main(["report", "--run-root", str(tmp_path / "only")])
+    assert "sigreg_only" in (tmp_path / "only/report/validation.md").read_text()
+    cfg.masking.enabled = True
+    with pytest.raises(ValueError, match="masking.enabled"):
+        MaskedTrainer(cfg).load_checkpoint(checkpoint)
+
+
+def test_sigreg_only_config():
+    from pathlib import Path
+    cfg = load_config(Path(__file__).parents[1] / "configs/sigreg_only.yaml")
+    assert cfg.masking.enabled is False
+    assert cfg.sigreg.weight == 1.0

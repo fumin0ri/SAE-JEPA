@@ -45,8 +45,14 @@ class MaskedTrainer(Trainer):
             "masking": "independent Bernoulli per token/coordinate; normalized zeros; no rescaling",
             "mask_probability": cfg.masking.probability,
         })
+        if not cfg.masking.enabled:
+            self.convention.update({"objective": "lambda * SIGReg(y_full)",
+                                    "views": "full input only; no consistency loss",
+                                    "masking": "disabled", "mask_probability": 0.0})
 
     def loss(self, h, diagnostics):
+        if not self.cfg.masking.enabled:
+            return self.sigreg_only_loss(h, diagnostics)
         with autocast_context(self.device, self.amp_dtype):
             full = self.model(h)
             masked = self.model.encode_normalized(mask_coordinates(
@@ -79,6 +85,24 @@ class MaskedTrainer(Trainer):
                 vf = v.detach().float()
                 metrics[f"{name}/mean_sq_per_dim"] = float(vf.mean(0).square().mean())
                 metrics[f"{name}/variance_mean"] = float(vf.var(0, unbiased=False).mean())
+        return loss, metrics
+
+    def sigreg_only_loss(self, h, diagnostics):
+        with autocast_context(self.device, self.amp_dtype):
+            y = self.model.encode_dense(h)
+        sigreg = self.sigreg(y)
+        loss = self.cfg.sigreg.weight * sigreg
+        if not torch.isfinite(loss):
+            raise ValueError("nonfinite SIGReg-only loss")
+        metrics = {}
+        if diagnostics:
+            gradient = torch.autograd.grad(loss, y, retain_graph=True)[0]
+            yf = y.detach().float()
+            metrics = {"loss": float(loss.detach()), "sigreg": float(sigreg.detach()),
+                       "sigreg_full": float(sigreg.detach()), "sigreg_weighted": float(loss.detach()),
+                       "grad_rms_y/full/sigreg_weighted": rms(gradient),
+                       "full/mean_sq_per_dim": float(yf.mean(0).square().mean()),
+                       "full/variance_mean": float(yf.var(0, unbiased=False).mean())}
         return loss, metrics
 
     def checkpoint_state(self):
@@ -121,7 +145,7 @@ def _evaluate(model, source, cfg, device, split, detailed, batches):
     if detailed:
         projections["diagnostic_"] = fixed_projections(d, ec.diagnostic_projections,
                                                       ec.diagnostic_seed, "diagnostic").to(device)
-    names = ("gaussian", "masked", "reference")  # gaussian = full-input representation
+    names = ("gaussian", "masked", "reference") if cfg.masking.enabled else ("gaussian", "reference")
     moments = {name: _Moments(d, device, covariance=detailed) for name in names}
     tests = {name: {key: _ProjectionDiagnostics(
         a, t, weights, sc.scale_by_batch_size,
@@ -135,10 +159,13 @@ def _evaluate(model, source, cfg, device, split, detailed, batches):
                          ec.batches if batches is None else batches, seed=ec.sample_seed):
         with autocast_context(device, cfg.optim.amp_dtype):
             full = model(h.to(device))
-            masked = model.encode_normalized(mask_coordinates(full["x"], cfg.masking.probability, masks))
-        values = {"gaussian": full["y"].float(), "masked": masked.float(),
+            if cfg.masking.enabled:
+                masked = model.encode_normalized(mask_coordinates(full["x"], cfg.masking.probability, masks))
+        values = {"gaussian": full["y"].float(),
                   "reference": torch.randn(len(h), d, generator=reference).to(device)}
-        consistency_sse += float((values["gaussian"].double() - values["masked"].double()).square().sum())
+        if cfg.masking.enabled:
+            values["masked"] = masked.float()
+            consistency_sse += float((values["gaussian"].double() - values["masked"].double()).square().sum())
         for name, v in values.items():
             if not torch.isfinite(v).all():
                 raise ValueError("nonfinite evaluation representation")
@@ -159,6 +186,10 @@ def _evaluate(model, source, cfg, device, split, detailed, batches):
               "mask_validation_seed": cfg.masking.validation_seed,
               "consistency/mse": consistency_sse / (n * d),
               "sigreg_gaussian_expected_value": gaussian_expected_value(t, weights)}
+    if not cfg.masking.enabled:
+        result.update(objective="sigreg_only", mask_probability=0.0)
+        del result["consistency/mse"]
+        del result["mask_validation_seed"]
     spectra = {}
     for name in names:
         result.update(moments[name].summary(f"{name}/"))
@@ -175,8 +206,9 @@ def _evaluate(model, source, cfg, device, split, detailed, batches):
                 result.update(trimmed.summary(f"{name}/trimmed/"))
                 spectra[f"{name}_trimmed"] = trimmed.eigenvalues
             result[f"{name}/trimmed/count"] = k
-    result["sigreg/two_view_mean"] = (
-        result["gaussian/heldout_sigreg"] + result["masked/heldout_sigreg"]) / 2
+    if cfg.masking.enabled:
+        result["sigreg/two_view_mean"] = (
+            result["gaussian/heldout_sigreg"] + result["masked/heldout_sigreg"]) / 2
     if detailed:
         result["_spectra"] = spectra
     return result
@@ -192,7 +224,7 @@ def report(run_root):
     rows = []
     for path in sorted(root.rglob("eval-*.json")):
         row = json.loads(path.read_text(encoding="utf-8"))
-        if row.get("objective") == "masked_consistency":
+        if row.get("objective") in {"masked_consistency", "sigreg_only"}:
             rows.append((path, row))
     if not rows:
         raise ValueError("no masked evaluations found")
@@ -202,18 +234,20 @@ def report(run_root):
         subset = [(p, r) for p, r in rows if r["split"] == split]
         lines = [f"# Masked stage 1: {split}", "",
                  "Full input is the downstream representation. Compare both views against the finite-sample Gaussian reference. No reconstruction decoder/FVU is available.", "",
-                 "| run | mask | lambda | consistency | SIGReg full | masked | ref | effective rank full | masked | ref |",
-                 "|---|---|---|---|---|---|---|---|---|---|"]
+                 "| run | objective | mask | lambda | consistency | SIGReg full | masked | ref | effective rank full | masked | ref |",
+                 "|---|---|---|---|---|---|---|---|---|---|---|"]
         fig, axes = plt.subplots(1, 2, figsize=(12, 4), squeeze=False)
         for path, row in subset:
             label = f"{row.get('run_name', path.parent.name)} step={row.get('step', '?')}"
             keys = ["mask_probability", "sigreg_weight", "consistency/mse", "gaussian/heldout_sigreg",
                     "masked/heldout_sigreg", "reference/heldout_sigreg", "gaussian/cov_effective_rank",
                     "masked/cov_effective_rank", "reference/cov_effective_rank"]
-            lines.append("| " + label + " | " + " | ".join(f"{row[k]:.6g}" if k in row else "" for k in keys) + " |")
+            lines.append("| " + label + " | " + row["objective"] + " | " + " | ".join(f"{row[k]:.6g}" if k in row else "" for k in keys) + " |")
             if "spectra_path" in row:
                 spectra = torch.load(path.parent / row["spectra_path"], map_location="cpu", weights_only=True)
                 for ax, name in zip(axes[0], ("gaussian", "masked")):
+                    if name not in spectra:
+                        continue
                     values = spectra[name]
                     ax.loglog(range(1, len(values) + 1), values.clamp_min(1e-10), label=label)
                     if len(ax.lines) == 1:
@@ -290,9 +324,8 @@ def main(argv=None):
     output = Path(args.output) if args.output else Path(args.checkpoint).parent.parent / f"eval-{args.split}-step-{state['step']:07d}.json"
     output.parent.mkdir(parents=True, exist_ok=True)
     write_evaluation(results, output)
-    print(f"{args.split}: consistency={results['consistency/mse']:.6f}, "
-          f"SIGReg full={results['gaussian/heldout_sigreg']:.3f}, "
-          f"masked={results['masked/heldout_sigreg']:.3f}")
+    print(f"{args.split}: objective={results['objective']}, "
+          f"SIGReg full={results['gaussian/heldout_sigreg']:.3f}")
 
 
 if __name__ == "__main__":

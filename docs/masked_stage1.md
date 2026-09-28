@@ -71,6 +71,27 @@ sj-masked report --run-root runs/masked-single
 
 ## 指標と読み方
 
+### SIGReg単体の切り分け
+
+`configs/sigreg_only.yaml`は`masking.enabled=false`とし、full入力のSIGRegだけで
+同じencoderを学習します。再構成、一致損失、masked branchは計算しません。
+λ=1で`L=SIGReg(G(x))`です。ほかの損失との重み比を探索する実験ではありません。
+既存のmask実験と同じ入力正規化を使い、別runとして開始してください。
+
+```bash
+sj-masked train --config configs/sigreg_only.yaml \
+  --set data.activation_manifest=/path/to/manifest.json \
+  --set data.normalization_path=runs/stage1-masked-100k/normalization.pt
+sj-masked report --run-root runs/stage1-sigreg-only-100k
+```
+
+学習終了時にvalidationのGaussian性・共分散・trimmed診断を自動保存します。
+`sj-masked evaluate`でも再評価できます。SIGReg単体ではmasked側と一致損失の指標は
+存在せず、レポートの該当欄は空欄です。旧checkpointは既定のmask有効として読み、
+mask有効/無効を切り替えた再開は拒否します。
+
+### 共通の評価指標
+
 - `consistency/mse`: fullとmaskedの一致。小ささだけでは情報保持を保証しません。
 - `gaussian/*`: 下流に使う**full入力**の表現のGaussian性・共分散。
 - `masked/*`: masked入力の同じ指標。

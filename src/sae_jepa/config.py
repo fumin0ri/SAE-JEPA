@@ -108,6 +108,7 @@ class EvalConfig:
 
 @dataclass
 class MaskingConfig:
+    enabled: bool = True  # False: full-input SIGReg only, no consistency loss
     probability: float = 0.25
     seed_offset: int = 2_000_003
     validation_seed: int = 81_001
@@ -125,6 +126,10 @@ class ExperimentConfig:
     masking: MaskingConfig = field(default_factory=MaskingConfig)
 
     def validate(self) -> None:
+        if not isinstance(self.masking.enabled, bool):
+            raise ValueError("masking.enabled must be a boolean")
+        if not self.masking.enabled and self.model.type != "masked_sigreg_encoder":
+            raise ValueError("masking.enabled=false requires model.type=masked_sigreg_encoder")
         if self.model.type not in {"dense_sigreg_ae", "masked_sigreg_encoder"}:
             raise ValueError(f"unknown model.type {self.model.type!r}")
         if not 0 < self.masking.probability < 1:
