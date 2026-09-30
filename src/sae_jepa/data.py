@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
@@ -136,10 +137,46 @@ def _safetensors_array(path: Path, name: str = "activations") -> tuple[np.memmap
     return array, info["dtype"]
 
 
+# Read a row span sequentially when at least this fraction of its rows is wanted.
+_DENSE_READ_FRACTION = 0.5
+
+
+def _read_span(path: Path, array: np.memmap, first: int, last: int) -> np.ndarray:
+    """Rows ``[first, last)`` of a memory-mapped tensor via one sequential read."""
+    span = np.empty((last - first,) + array.shape[1:], dtype=array.dtype)
+    row_bytes = span.itemsize * int(np.prod(array.shape[1:], dtype=np.int64))
+    view = memoryview(span).cast("B")
+    with path.open("rb", buffering=0) as f:
+        f.seek(array.offset + first * row_bytes)
+        done = 0
+        while done < len(view):
+            count = f.readinto(view[done:])
+            if not count:
+                raise OSError(f"unexpected end of file in {path}")
+            done += count
+    return span
+
+
 def read_safetensors_rows(path: Path, rows: torch.Tensor) -> torch.Tensor:
-    """Selected rows of a flat ``[num_tokens, d]`` safetensors ``activations`` tensor."""
+    """Selected rows of a flat ``[num_tokens, d]`` safetensors ``activations`` tensor.
+
+    Dense selections (e.g. every usable position of a shard) are read as one
+    sequential span and indexed in memory: fancy-indexing a memmap faults its
+    pages in one at a time on a single thread, which is far slower than a
+    plain sequential read.  Sparse selections (evaluation samples) keep the
+    memmap.
+    """
     array, dtype = _safetensors_array(path)
-    values = torch.from_numpy(np.ascontiguousarray(array[rows.numpy()]))
+    index = rows.numpy()
+    first = int(index.min()) if len(index) else 0
+    last = int(index.max()) + 1 if len(index) else 0
+    if len(index) and len(index) >= _DENSE_READ_FRACTION * (last - first):
+        span = _read_span(path, array, first, last)
+        local = index - first
+        dense = len(local) == len(span) and bool((local == np.arange(len(span))).all())
+        values = torch.from_numpy(span if dense else span[local])
+    else:
+        values = torch.from_numpy(np.ascontiguousarray(array[index]))
     return values.view(torch.bfloat16) if dtype == "BF16" else values
 
 
@@ -441,6 +478,12 @@ class TrainBatches:
     every permutation is a pure function of these integers, the iterator state
     is just ``(epoch, window, offset)`` and resuming never needs buffered data.
     Positions left over at the end of a window (< one batch) are dropped.
+
+    With ``prefetch`` the shards of a window are read in parallel and the next
+    window is loaded in a background thread while the current one is consumed.
+    Batches are identical with or without it; the prefetched window is only
+    held in memory (about twice the window size at peak) and is never part of
+    the resumable state.
     """
 
     def __init__(
@@ -449,6 +492,7 @@ class TrainBatches:
         batch_size: int,
         seed: int,
         shards_per_window: int = 4,
+        prefetch: bool = True,
     ):
         if batch_size < 1 or shards_per_window < 1:
             raise ValueError("batch_size and shards_per_window must be positive")
@@ -462,6 +506,12 @@ class TrainBatches:
         self.offset = 0
         self._rows: torch.Tensor | None = None
         self._order: torch.Tensor | None = None
+        self._readers: ThreadPoolExecutor | None = None
+        self._prefetcher: ThreadPoolExecutor | None = None
+        if prefetch:
+            self._readers = ThreadPoolExecutor(shards_per_window, thread_name_prefix="shard-read")
+            self._prefetcher = ThreadPoolExecutor(1, thread_name_prefix="window-prefetch")
+        self._pending: tuple[tuple[int, int], Future] | None = None
 
     @property
     def windows_per_epoch(self) -> int:
@@ -470,20 +520,42 @@ class TrainBatches:
     def __iter__(self) -> "TrainBatches":
         return self
 
-    def _load_window(self) -> None:
+    def _following(self, epoch: int, window: int) -> tuple[int, int]:
+        window += 1
+        return (epoch + 1, 0) if window >= self.windows_per_epoch else (epoch, window)
+
+    def _build_window(self, epoch: int, window: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Rows of window ``(epoch, window)`` and their permutation (pure function)."""
         shard_order = torch.randperm(
             len(self.paths),
-            generator=torch.Generator().manual_seed(mix_seed(self.seed, self.epoch)),
+            generator=torch.Generator().manual_seed(mix_seed(self.seed, epoch)),
         ).tolist()
-        start = self.window * self.shards_per_window
-        selected = shard_order[start : start + self.shards_per_window]
-        self._rows = torch.cat([self.source.positions(self.paths[i]) for i in selected])
-        self._order = torch.randperm(
-            len(self._rows),
-            generator=torch.Generator().manual_seed(
-                mix_seed(self.seed, self.epoch, self.window)
-            ),
+        start = window * self.shards_per_window
+        selected = [self.paths[i] for i in shard_order[start : start + self.shards_per_window]]
+        if self._readers is not None:
+            parts = list(self._readers.map(self.source.positions, selected))
+        else:
+            parts = [self.source.positions(path) for path in selected]
+        rows = parts[0] if len(parts) == 1 else torch.cat(parts)
+        del parts
+        order = torch.randperm(
+            len(rows),
+            generator=torch.Generator().manual_seed(mix_seed(self.seed, epoch, window)),
         )
+        return rows, order
+
+    def _load_window(self) -> None:
+        key = (self.epoch, self.window)
+        pending, self._pending = self._pending, None
+        if pending is not None and pending[0] == key:
+            self._rows, self._order = pending[1].result()
+        else:
+            if pending is not None:
+                pending[1].cancel()
+            self._rows, self._order = self._build_window(*key)
+        if self._prefetcher is not None:
+            following = self._following(*key)
+            self._pending = (following, self._prefetcher.submit(self._build_window, *following))
 
     def _advance_window(self) -> None:
         self._rows = None
