@@ -141,9 +141,19 @@ def _safetensors_array(path: Path, name: str = "activations") -> tuple[np.memmap
 _DENSE_READ_FRACTION = 0.5
 
 
-def _read_span(path: Path, array: np.memmap, first: int, last: int) -> np.ndarray:
-    """Rows ``[first, last)`` of a memory-mapped tensor via one sequential read."""
-    span = np.empty((last - first,) + array.shape[1:], dtype=array.dtype)
+def _read_span(
+    path: Path, array: np.memmap, first: int, last: int, out: np.ndarray | None = None
+) -> np.ndarray:
+    """Rows ``[first, last)`` of a memory-mapped tensor via one sequential read.
+
+    ``out`` (C-contiguous, ``last - first`` rows) receives the rows in place.
+    The read releases the GIL, so several spans can be read in parallel.
+    """
+    span = np.empty((last - first,) + array.shape[1:], dtype=array.dtype) if out is None else out
+    if span.shape != (last - first,) + array.shape[1:] or not span.flags.c_contiguous:
+        raise ValueError("span buffer has the wrong shape or layout")
+    if not len(span):
+        return span
     row_bytes = span.itemsize * int(np.prod(array.shape[1:], dtype=np.int64))
     view = memoryview(span).cast("B")
     with path.open("rb", buffering=0) as f:
@@ -171,10 +181,11 @@ def read_safetensors_rows(path: Path, rows: torch.Tensor) -> torch.Tensor:
     first = int(index.min()) if len(index) else 0
     last = int(index.max()) + 1 if len(index) else 0
     if len(index) and len(index) >= _DENSE_READ_FRACTION * (last - first):
-        span = _read_span(path, array, first, last)
+        values = torch.from_numpy(_read_span(path, array, first, last))
         local = index - first
-        dense = len(local) == len(span) and bool((local == np.arange(len(span))).all())
-        values = torch.from_numpy(span if dense else span[local])
+        if len(local) != len(values) or not bool((np.diff(local) == 1).all()):
+            # torch's gather is multithreaded and releases the GIL; numpy's is not.
+            values = values.index_select(0, torch.from_numpy(local))
     else:
         values = torch.from_numpy(np.ascontiguousarray(array[index]))
     return values.view(torch.bfloat16) if dtype == "BF16" else values
@@ -524,25 +535,72 @@ class TrainBatches:
         window += 1
         return (epoch + 1, 0) if window >= self.windows_per_epoch else (epoch, window)
 
+    def _map(self, function: Callable[[Any], Any], items: list[Any]) -> list[Any]:
+        if self._readers is None:
+            return [function(item) for item in items]
+        return list(self._readers.map(function, items))
+
     def _build_window(self, epoch: int, window: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Rows of window ``(epoch, window)`` and their permutation (pure function)."""
+        """Storage and batch order of window ``(epoch, window)`` (pure function).
+
+        Batch ``b`` is ``storage[order[b * batch_size : (b + 1) * batch_size]]``.
+        The usable positions of the window, concatenated shard by shard, are
+        permuted by ``(seed, epoch, window)``; ``order`` maps that permutation
+        onto rows of ``storage``.
+        """
         shard_order = torch.randperm(
             len(self.paths),
             generator=torch.Generator().manual_seed(mix_seed(self.seed, epoch)),
         ).tolist()
         start = window * self.shards_per_window
         selected = [self.paths[i] for i in shard_order[start : start + self.shards_per_window]]
-        if self._readers is not None:
-            parts = list(self._readers.map(self.source.positions, selected))
+        if self.source.format == LEJEPA_FORMAT:
+            storage, kept = self._read_lejepa_window(selected)
         else:
-            parts = [self.source.positions(path) for path in selected]
-        rows = parts[0] if len(parts) == 1 else torch.cat(parts)
-        del parts
+            parts = self._map(self.source.positions, selected)
+            storage = parts[0] if len(parts) == 1 else torch.cat(parts)
+            del parts
+            kept = None
+        count = len(storage) if kept is None else len(kept)
         order = torch.randperm(
-            len(rows),
+            count,
             generator=torch.Generator().manual_seed(mix_seed(self.seed, epoch, window)),
         )
-        return rows, order
+        return storage, order if kept is None else kept[order]
+
+    def _read_lejepa_window(self, entries: list[str]) -> tuple[torch.Tensor, torch.Tensor]:
+        """Read each shard's usable span straight into one window buffer.
+
+        Skipped positions (e.g. the leading token of every sequence) stay in the
+        buffer; ``kept`` lists the buffer rows of the usable positions in
+        :meth:`DataSource.positions` order, so no row is copied after reading.
+        """
+        plans = []  # (path, memmap, first row, last row, buffer offset)
+        kept = []
+        dtypes = set()
+        size = 0
+        for entry in entries:
+            path = self.source._resolve(entry)[0]
+            array, dtype = _safetensors_array(path)
+            dtypes.add((dtype, array.shape[1:]))
+            rows = self.source._flat_rows(entry, None)
+            first = int(rows.min()) if len(rows) else 0
+            last = int(rows.max()) + 1 if len(rows) else 0
+            plans.append((path, array, first, last, size))
+            kept.append(rows - first + size)
+            size += last - first
+        if len(dtypes) != 1:
+            raise ValueError("train shards differ in dtype or row shape")
+        (dtype, row_shape), = dtypes
+        buffer = np.empty((size,) + row_shape, dtype=plans[0][1].dtype)
+
+        def read(plan: tuple[Path, np.memmap, int, int, int]) -> None:
+            path, array, first, last, offset = plan
+            _read_span(path, array, first, last, buffer[offset : offset + last - first])
+
+        self._map(read, plans)
+        storage = torch.from_numpy(buffer)
+        return (storage.view(torch.bfloat16) if dtype == "BF16" else storage), torch.cat(kept)
 
     def _load_window(self) -> None:
         key = (self.epoch, self.window)
@@ -572,7 +630,7 @@ class TrainBatches:
             if self._rows is None:
                 self._load_window()
             assert self._rows is not None and self._order is not None
-            if self.offset + self.batch_size <= len(self._rows):
+            if self.offset + self.batch_size <= len(self._order):
                 index = self._order[self.offset : self.offset + self.batch_size]
                 self.offset += self.batch_size
                 return self._rows.index_select(0, index)

@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import torch
 
-from sae_jepa.data import DataSource, TrainBatches, _safetensors_array, read_safetensors_rows
+from sae_jepa.data import DataSource, TrainBatches, _safetensors_array, mix_seed, read_safetensors_rows
 from sae_jepa.synthetic import make_lejepa_manifest, make_synthetic_manifest
 
 
@@ -23,6 +23,38 @@ def test_sequential_read_matches_memmap(tmp_path, k):
         assert torch.equal(read_safetensors_rows(file, rows), _memmap_rows(file, rows))
         sparse = rows[:: max(1, len(rows) // 3)]
         assert torch.equal(read_safetensors_rows(file, sparse), _memmap_rows(file, sparse))
+
+
+def _original_batches(source, batch_size, seed, shards_per_window, count):
+    """Batches produced by the original (copying) TrainBatches implementation."""
+    paths = source.paths("train")
+    windows = -(-len(paths) // shards_per_window)
+    out, epoch = [], 0
+    while len(out) < count:
+        shard_order = torch.randperm(
+            len(paths), generator=torch.Generator().manual_seed(mix_seed(seed, epoch))
+        ).tolist()
+        for window in range(windows):
+            chosen = shard_order[window * shards_per_window : (window + 1) * shards_per_window]
+            rows = torch.cat([source.positions(paths[i]) for i in chosen])
+            order = torch.randperm(
+                len(rows), generator=torch.Generator().manual_seed(mix_seed(seed, epoch, window))
+            )
+            for offset in range(0, len(rows) - batch_size + 1, batch_size):
+                out.append(rows[order[offset : offset + batch_size]])
+        epoch += 1
+    return out[:count]
+
+
+@pytest.mark.parametrize("layout", ["lejepa", "jepa"])
+@pytest.mark.parametrize("k", [0, 1, 3])
+@pytest.mark.parametrize("prefetch", [False, True])
+def test_batches_match_original_implementation(tmp_path, layout, k, prefetch):
+    make = make_lejepa_manifest if layout == "lejepa" else make_synthetic_manifest
+    source = DataSource(make(tmp_path / "d", d_in=8), skip_leading_positions=k)
+    batches = TrainBatches(source, 16, seed=5, shards_per_window=2, prefetch=prefetch)
+    for expected in _original_batches(source, 16, 5, 2, 60):
+        assert torch.equal(next(batches), expected)
 
 
 @pytest.mark.parametrize("layout", ["lejepa", "jepa"])
