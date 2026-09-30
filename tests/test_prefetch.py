@@ -4,7 +4,14 @@ import numpy as np
 import pytest
 import torch
 
-from sae_jepa.data import DataSource, TrainBatches, _safetensors_array, mix_seed, read_safetensors_rows
+from sae_jepa.data import (
+    READ_THREADS_ENV,
+    DataSource,
+    TrainBatches,
+    _safetensors_array,
+    mix_seed,
+    read_safetensors_rows,
+)
 from sae_jepa.synthetic import make_lejepa_manifest, make_synthetic_manifest
 
 
@@ -48,8 +55,9 @@ def _original_batches(source, batch_size, seed, shards_per_window, count):
 
 @pytest.mark.parametrize("layout", ["lejepa", "jepa"])
 @pytest.mark.parametrize("k", [0, 1, 3])
-@pytest.mark.parametrize("prefetch", [False, True])
-def test_batches_match_original_implementation(tmp_path, layout, k, prefetch):
+@pytest.mark.parametrize("prefetch,threads", [(False, "1"), (True, "1"), (True, "4")])
+def test_batches_match_original_implementation(tmp_path, monkeypatch, layout, k, prefetch, threads):
+    monkeypatch.setenv(READ_THREADS_ENV, threads)
     make = make_lejepa_manifest if layout == "lejepa" else make_synthetic_manifest
     source = DataSource(make(tmp_path / "d", d_in=8), skip_leading_positions=k)
     batches = TrainBatches(source, 16, seed=5, shards_per_window=2, prefetch=prefetch)

@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, Iterator
@@ -30,6 +31,8 @@ import torch
 ACTIVATION_FORMAT = "shared-residual-sequence-shards-v2"
 LEJEPA_FORMAT = "lejepa-sae-safetensors-v1"
 SPLITS = ("train", "validation", "test")
+# Number of shards of a train window read in parallel (default 1: best on hard disks).
+READ_THREADS_ENV = "SAE_JEPA_READ_THREADS"
 
 
 def torch_load(path: str | Path) -> Any:
@@ -490,9 +493,11 @@ class TrainBatches:
     is just ``(epoch, window, offset)`` and resuming never needs buffered data.
     Positions left over at the end of a window (< one batch) are dropped.
 
-    With ``prefetch`` the shards of a window are read in parallel and the next
-    window is loaded in a background thread while the current one is consumed.
-    Batches are identical with or without it; the prefetched window is only
+    With ``prefetch`` the next window is loaded in a background thread while
+    the current one is consumed.  Shards are read one after another by default
+    because parallel streams make a hard disk seek between files; on SSDs set
+    ``SAE_JEPA_READ_THREADS`` (e.g. to ``shards_per_window``) to read them in
+    parallel.  Batches are identical either way; the prefetched window is only
     held in memory (about twice the window size at peak) and is never part of
     the resumable state.
     """
@@ -520,7 +525,9 @@ class TrainBatches:
         self._readers: ThreadPoolExecutor | None = None
         self._prefetcher: ThreadPoolExecutor | None = None
         if prefetch:
-            self._readers = ThreadPoolExecutor(shards_per_window, thread_name_prefix="shard-read")
+            threads = min(shards_per_window, max(1, int(os.environ.get(READ_THREADS_ENV, "1"))))
+            if threads > 1:
+                self._readers = ThreadPoolExecutor(threads, thread_name_prefix="shard-read")
             self._prefetcher = ThreadPoolExecutor(1, thread_name_prefix="window-prefetch")
         self._pending: tuple[tuple[int, int], Future] | None = None
 
