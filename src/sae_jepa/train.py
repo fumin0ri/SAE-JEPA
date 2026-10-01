@@ -75,6 +75,7 @@ RESUMABLE_KEYS = {
     "name",
     "data.activation_manifest",
     "data.normalization_path",
+    "data.input_whitening_path",
     "train.output_dir",
     "train.device",
     "train.log_every",

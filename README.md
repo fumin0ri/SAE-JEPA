@@ -312,3 +312,11 @@ the complete token sequence through the original LLM block. Replayed activations
 storage casting, and new serialization round-trips are checked separately.
 See [the activation verification guide](docs/activation_verification.md) for commands,
 input requirements, and the limits of revision/mask/precision matching.
+
+### SIGReg-only input whitening control
+
+`sj-fit-input-whitening` fits a frozen, regularized full-dimensional ZCA transform
+on train activations only. `scripts/stage1_input_whitening_compare.sh` compares
+scalar-normalized and whitened inputs with identical initialization and training
+settings. See [the input whitening guide](docs/input_whitening.md) for the fit,
+training, checkpoint, and input-covariance diagnostics workflow.

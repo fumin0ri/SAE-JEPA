@@ -7,7 +7,8 @@ mean vector and ``s`` is one scalar shared by all coordinates:
 
 Only mean and overall scale are removed; correlations and the per-coordinate
 variance profile are left for the encoder.  PCA whitening is provided as a
-separate comparison front-end (``sj-fit-pca``), never inside the dense model.
+separate comparison front-end (``sj-fit-pca``). The SIGReg-only input-ZCA
+ablation is fitted separately by ``sj-fit-input-whitening``.
 """
 
 from __future__ import annotations

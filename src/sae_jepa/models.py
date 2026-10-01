@@ -89,6 +89,21 @@ class MaskedSIGRegEncoder(DenseSIGRegAE):
     def decode_normalized(self, y: torch.Tensor) -> torch.Tensor:
         raise ValueError("masked encoder has no decoder; fit a frozen-encoder readout first")
 
+    def normalize(self, h: torch.Tensor) -> torch.Tensor:
+        x = super().normalize(h)
+        if hasattr(self, "whitening_matrix"):
+            # Whitening must not be rounded to bf16 by the encoder's autocast.
+            with torch.autocast(device_type=x.device.type, enabled=False):
+                previous = torch.backends.cuda.matmul.allow_tf32
+                try:
+                    if x.device.type == 'cuda':
+                        torch.backends.cuda.matmul.allow_tf32 = False
+                    x = (x.float() - self.whitening_center) @ self.whitening_matrix
+                finally:
+                    if x.device.type == 'cuda':
+                        torch.backends.cuda.matmul.allow_tf32 = previous
+        return x
+
     def forward(self, h: torch.Tensor) -> dict[str, torch.Tensor]:
         if h.ndim != 2 or h.shape[-1] != self.cfg.d_in:
             raise ValueError("h must have shape [batch, d_in]")

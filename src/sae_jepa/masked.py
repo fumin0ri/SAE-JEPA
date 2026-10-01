@@ -36,6 +36,12 @@ class MaskedTrainer(Trainer):
         if cfg.model.type != "masked_sigreg_encoder":
             raise ValueError("sj-masked requires model.type=masked_sigreg_encoder")
         super().__init__(cfg)
+        self.input_whitening = None
+        if cfg.data.input_whitening_path:
+            from .input_whitening import install, validate
+            self.input_whitening = torch.load(cfg.data.input_whitening_path, map_location='cpu', weights_only=False)
+            validate(self.input_whitening, self.source, self.normalization)
+            install(self.model, self.input_whitening)
         self.mask_generator = torch.Generator().manual_seed(
             mix_seed(cfg.train.seed, cfg.masking.seed_offset)
         )
@@ -49,6 +55,10 @@ class MaskedTrainer(Trainer):
             self.convention.update({"objective": "lambda * SIGReg(y_full)",
                                     "views": "full input only; no consistency loss",
                                     "masking": "disabled", "mask_probability": 0.0})
+        self.convention['input_transform'] = 'zca' if self.input_whitening is not None else 'scalar'
+        if self.input_whitening is not None:
+            self.convention['input_whitening'] = {k: self.input_whitening[k] for k in
+                ('epsilon', 'count', 'sampling', 'convention')}
 
     def loss(self, h, diagnostics):
         if not self.cfg.masking.enabled:
@@ -109,12 +119,23 @@ class MaskedTrainer(Trainer):
         state = super().checkpoint_state()
         state["architecture_id"] = ARCHITECTURE_ID
         state["rng"]["mask"] = self.mask_generator.get_state()
+        if self.input_whitening is not None:
+            state['input_whitening'] = self.input_whitening
         return state
 
     def load_checkpoint(self, path):
         state = torch.load(path, map_location="cpu", weights_only=False)
         if state.get("architecture_id") != ARCHITECTURE_ID or "mask" not in state.get("rng", {}):
             raise ValueError("not a resumable masked encoder checkpoint")
+        saved = state.get('input_whitening')
+        if (saved is None) != (self.input_whitening is None):
+            raise ValueError('cannot resume: input whitening changed')
+        if saved is not None:
+            for key in ('matrix', 'center', 'mean'):
+                if not torch.equal(saved[key], self.input_whitening[key]):
+                    raise ValueError('cannot resume: input whitening statistics changed')
+            if saved['epsilon'] != self.input_whitening['epsilon']:
+                raise ValueError('cannot resume: input whitening epsilon changed')
         super().load_checkpoint(path)
         self.mask_generator.set_state(state["rng"]["mask"])
 
@@ -155,6 +176,7 @@ def _evaluate(model, source, cfg, device, split, detailed, batches, norm_diagnos
         w2=key == "diagnostic_") for key, a in projections.items()} for name in names}
     tops = {name: _TopRows(ec.outlier_buffer, d, device) for name in names} if detailed else {}
     norms = {name: [] for name in names}
+    input_moments = _Moments(cfg.model.d_in, device, covariance=True) if detailed and ec.input_diagnostics else None
     n, count, consistency_sse = 0, 0, 0.0
     for item in eval_batches(source, split, ec.batch_size,
                             ec.batches if batches is None else batches, seed=ec.sample_seed,
@@ -169,6 +191,8 @@ def _evaluate(model, source, cfg, device, split, detailed, batches, norm_diagnos
             norm_diagnostics.add(h, full["x"], full["y"], metadata, source.paths(split),
                                  masked_x=masked_x if cfg.masking.enabled else None,
                                  masked_y=masked if cfg.masking.enabled else None)
+        if input_moments is not None:
+            input_moments.add(full['x'].float())
         values = {"gaussian": full["y"].float(),
                   "reference": torch.randn(len(h), d, generator=reference).to(device)}
         if cfg.masking.enabled:
@@ -199,6 +223,13 @@ def _evaluate(model, source, cfg, device, split, detailed, batches, norm_diagnos
         del result["consistency/mse"]
         del result["mask_validation_seed"]
     spectra = {}
+    result['input_transform'] = 'zca' if hasattr(model, 'whitening_matrix') else 'scalar'
+    if hasattr(model, 'whitening_matrix'):
+        result['input_whitening_epsilon'] = model.whitening_epsilon
+        result['input_whitening_fit_count'] = model.whitening_count
+    if input_moments is not None:
+        result.update(input_moments.summary('encoder_input/'))
+        spectra['encoder_input'] = input_moments.eigenvalues
     for name in names:
         result.update(moments[name].summary(f"{name}/"))
         for key, test in tests[name].items():
@@ -321,6 +352,12 @@ def main(argv=None):
     device = resolve_device(args.device)
     with torch.random.fork_rng(devices=[]):
         model = build_model(cfg.model, state["normalization"]["mean"], state["normalization"]["scale"])
+    whitening = state.get('input_whitening')
+    if bool(cfg.data.input_whitening_path) != (whitening is not None):
+        raise ValueError('checkpoint input whitening metadata missing or inconsistent')
+    if whitening is not None:
+        from .input_whitening import install
+        install(model, whitening)
     model.load_state_dict(state["model"])
     source = DataSource(args.activation_manifest or cfg.data.activation_manifest,
                         skip_burn_in=cfg.data.skip_burn_in,
@@ -330,6 +367,9 @@ def main(argv=None):
     if source.fingerprint != state["data_manifest"]["fingerprint"] or source.splits != state["data_manifest"]["splits"]:
         raise ValueError("evaluation data differs from training data/splits")
     check_normalization_matches(state["normalization"], source)
+    if whitening is not None:
+        from .input_whitening import validate
+        validate(whitening, source, state['normalization'])
     from .norm_diagnostics import NormDiagnostics
     diagnostic = NormDiagnostics(args.norm_outlier_fraction) if args.norm_diagnostics else None
     results = evaluate_masked(model.to(device), source, cfg, device, split=args.split,
@@ -346,7 +386,7 @@ def main(argv=None):
             "batch_size": cfg.eval.batch_size, "batches": results["batches"],
             "masking_enabled": cfg.masking.enabled, "mask_probability": results["mask_probability"],
             "mask_validation_seed": cfg.masking.validation_seed if cfg.masking.enabled else None,
-            "amp_dtype": cfg.optim.amp_dtype})
+            "amp_dtype": cfg.optim.amp_dtype, "input_transform": results['input_transform']})
     write_evaluation(results, output)
     print(f"{args.split}: objective={results['objective']}, "
           f"SIGReg full={results['gaussian/heldout_sigreg']:.3f}")

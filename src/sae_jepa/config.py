@@ -15,6 +15,7 @@ class DataConfig:
     # Train-only statistics from ``sj-compute-normalization``.  When empty,
     # they are computed at startup and saved next to the run.
     normalization_path: str = ""
+    input_whitening_path: str = ""  # frozen train-fit ZCA; SIGReg-only ablation
     skip_burn_in: bool = True
     # Drop token positions < k of every stored sequence from normalization,
     # training and evaluation (1 = drop the first token of each segment, whose
@@ -80,6 +81,7 @@ class TrainConfig:
 
 @dataclass
 class EvalConfig:
+    input_diagnostics: bool = False  # covariance of the actual encoder input
     split: str = "validation"
     batch_size: int = 512  # same N as training so SIGReg values are comparable
     # Evaluation batches are a fixed random sample of positions drawn from the
@@ -126,6 +128,8 @@ class ExperimentConfig:
     masking: MaskingConfig = field(default_factory=MaskingConfig)
 
     def validate(self) -> None:
+        if self.data.input_whitening_path and (self.model.type != "masked_sigreg_encoder" or self.masking.enabled):
+            raise ValueError("input whitening currently requires SIGReg-only (masked encoder, masking.enabled=false)")
         if not isinstance(self.masking.enabled, bool):
             raise ValueError("masking.enabled must be a boolean")
         if not self.masking.enabled and self.model.type != "masked_sigreg_encoder":

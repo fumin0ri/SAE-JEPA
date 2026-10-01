@@ -71,6 +71,8 @@ sj-masked report --run-root runs/masked-single
 
 ## 指標と読み方
 
+SIGReg単体での入力ZCA whitening対照は、[入力whitening実験](input_whitening.md)を参照してください。
+
 ### 同じサンプルの入力・出力ノルムを調べる
 
 既存checkpointを再学習せず、評価時に `--norm-diagnostics` を追加します。
@@ -88,7 +90,7 @@ sj-masked evaluate --checkpoint "$run_dir/checkpoints/latest.pt" \
 
 - `eval-validation-norms-norm-samples.jsonl`: 全評価サンプルの対応表。
   `h_sqnorm_per_dim` は生activation、`x_sqnorm_per_dim` はtrain平均・共通スカラー
-  で正規化した入力、`y_sqnorm_per_dim` はfull出力の二乗ノルム/各ベクトルの次元。
+  で正規化した入力（入力whiteningを有効にした場合は、その変換後）、`y_sqnorm_per_dim` はfull出力の二乗ノルム/各ベクトルの次元。
   masked学習の場合は `masked_x_sqnorm_per_dim` と `masked_y_sqnorm_per_dim` も保存。
   `sample_index` は評価順、`entry` はsplitのshard一覧へのindex、`shard` はmanifest内のentry、
   `sequence` と `position` はshard内のsequence indexとその中のtoken位置（0始まり）。
