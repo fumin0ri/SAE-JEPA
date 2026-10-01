@@ -22,6 +22,11 @@ sigreg:
   num_points: 17
   scale_by_batch_size: true
   resample_every_step: true
+covariance:
+  weight: 0.0  # beta; enable explicitly for Strong SIGReg + covariance
+  sketch_dim: 64  # <= d_latent, < both training and evaluation batch sizes
+  seed_offset: 4000037
+  validation_seed: 91003
 optim:
   batch_size: 512
   lr: 0.0001

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from pathlib import Path
 from typing import Any
@@ -54,6 +55,14 @@ class SIGRegConfig:
     seed_offset: int = 1_000_003
     validation_seed: int = 20_240_917
     validation_projections: int = 256
+
+
+@dataclass
+class CovarianceConfig:
+    weight: float = 0.0  # beta; zero preserves the original objective and RNGs
+    sketch_dim: int = 64
+    seed_offset: int = 4_000_037
+    validation_seed: int = 91_003
 
 
 @dataclass
@@ -135,8 +144,21 @@ class ExperimentConfig:
     train: TrainConfig = field(default_factory=TrainConfig)
     eval: EvalConfig = field(default_factory=EvalConfig)
     masking: MaskingConfig = field(default_factory=MaskingConfig)
+    covariance: CovarianceConfig = field(default_factory=CovarianceConfig)
 
     def validate(self) -> None:
+        cc = self.covariance
+        if not math.isfinite(cc.weight) or cc.weight < 0:
+            raise ValueError("covariance.weight must be finite and non-negative")
+        if type(cc.sketch_dim) is not int or cc.sketch_dim < 1:
+            raise ValueError("covariance.sketch_dim must be a positive integer")
+        if cc.weight > 0:
+            if self.model.type != "masked_sigreg_encoder":
+                raise ValueError("covariance requires model.type=masked_sigreg_encoder")
+            if cc.sketch_dim > self.model.d_latent or cc.sketch_dim >= self.optim.batch_size:
+                raise ValueError("covariance.sketch_dim must be <= d_latent and < training batch size")
+            if cc.sketch_dim >= self.eval.batch_size:
+                raise ValueError("covariance.sketch_dim must be < evaluation batch size")
         if self.data.input_whitening_path and (self.model.type != "masked_sigreg_encoder" or self.masking.enabled):
             raise ValueError("input whitening currently requires SIGReg-only (masked encoder, masking.enabled=false)")
         if not isinstance(self.masking.enabled, bool):

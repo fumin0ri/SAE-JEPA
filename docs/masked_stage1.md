@@ -69,6 +69,59 @@ sj-masked report --run-root runs/masked-single
 `python -m sae_jepa.masked ...`も同じです。
 評価の`--set`はeval.*のみ許可します。mask率はcheckpointの設定を使います。
 
+## Strong SIGReg + sketched covariance
+
+`covariance.weight=beta > 0` で、既存の目的に次を追加します。
+
+```text
+R = reduced_QR(randn(d_latent, k)).Q   # R.T @ R = I_k; every step
+z_view = y_view.float() @ R
+z_view = z_view - z_view.mean(0)
+C_view = z_view.T @ z_view / (B - 1)
+cov_view = mean((C_view - I_k)^2)
+L += beta * (cov_full + cov_mask) / 2
+```
+
+両枝は同じRを使い、中心化・共分散計算は枝ごとに行います。
+`masking.enabled=false` ではfull枝だけに追加します。decoderは追加しません。
+計算はautocastを無効にしたfloat32です。Frobeniusノルムの二乗を **k²で割る**
+規約であり、SIGRegのようなB係数は掛けません。平均の制約はStrong SIGRegが担います。
+
+```bash
+sj-masked train --config configs/masked_sigreg.yaml \
+  --set data.activation_manifest=/path/to/manifest.json \
+  --set train.output_dir=runs/masked-cov-beta1 \
+  --set masking.probability=0.1 --set sigreg.weight=0.1 \
+  --set covariance.weight=1.0 --set covariance.sketch_dim=64 \
+  --set model.init_output_variance=1.0
+```
+
+beta=1は動作例であり、最適値ではありません。初期出力調整も任意です。
+入力は既定のscalar正規化で、ZCAを自動適用しません。
+対照は同条件で `covariance.weight=0` とし、別の出力ディレクトリで学習します。
+既定のweight=0では共分散損失も射影生成も行わず、従来の学習挙動を維持します。
+`1 <= k <= d_latent`、`k < optim.batch_size`、`k < eval.batch_size` が必要です。
+
+射影用の専用CPU RNGをcheckpointへ保存します。データ順序・mask・SIGRegのRNGは
+消費しません。学習設定を変えた再開は拒否します。共分散設定を持たない旧checkpointは、
+既定の無効状態で再開できます。
+
+学習ログは `covariance`、`covariance_full`、`covariance_masked`、
+`covariance_weighted` と `grad_rms_y/{full,masked}/covariance_weighted` を記録します。
+mask無効時はmasked項を出しません。betaは重み付きSIGReg・consistencyとの勾配RMSを
+比較して調整してください。
+
+評価では専用seedの固定直交射影を用い、batchごとの損失平均を
+`{gaussian,masked,reference}/sketched_covariance` に記録します。
+これは評価全体を集計した既存の共分散・固有値指標とは別です。
+重み・k・評価seedも保存し、reportにはbetaとkを表示します。
+
+有限batchでは、独立な標準ガウスでも期待値は `(k+1)/(k*(B-1))` です。
+これを `covariance_gaussian_expected_value` として併記します。
+ノイズフロアの減算やバイアス補正は行いません。ガウス母共分散 `a I_k` に対して
+この損失単独が好む分散は `a=(B-1)/(B+k)` なので、平均分散の縮小にも注意します。
+検証にはheld-out SIGReg・全共分散のPR／有効ランク／最大固有値・ノルム尾部も使ってください。
+
 ## 指標と読み方
 
 SIGReg単体での入力ZCA whitening対照は、[入力whitening実験](input_whitening.md)を参照してください。

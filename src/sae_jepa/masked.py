@@ -15,6 +15,8 @@ import torch
 from torch.nn import functional as F
 
 from .config import config_from_dict, load_config, parse_override, update_config
+from .covariance import (gaussian_covariance_expected_value, sample_orthonormal_sketch,
+                         sketched_covariance_loss)
 from .data import DataSource, eval_batches, mix_seed
 from .evaluate import (_Moments, _ProjectionDiagnostics, _TopRows, write_evaluation)
 from .models import build_model
@@ -79,6 +81,10 @@ class MaskedTrainer(Trainer):
         self.mask_generator = torch.Generator().manual_seed(
             mix_seed(cfg.train.seed, cfg.masking.seed_offset)
         )
+        self.covariance_generator = None
+        if cfg.covariance.weight > 0:
+            self.covariance_generator = torch.Generator().manual_seed(
+                mix_seed(cfg.train.seed, cfg.covariance.seed_offset))
         self.convention.update({
             "objective": "MSE(y_mask,y_full) + lambda * (SIGReg(y_full)+SIGReg(y_mask))/2",
             "views": "shared encoder; gradients through both branches; shared projections per step",
@@ -95,6 +101,34 @@ class MaskedTrainer(Trainer):
                 ('epsilon', 'count', 'sampling', 'convention')}
         if self.output_init is not None:
             self.convention['output_init'] = self.output_init
+        if self.covariance_generator is not None:
+            self.convention["objective"] += " + beta * mean_view(CovLoss(y_view))"
+            self.convention["covariance"] = {
+                "formula": "mean((Cov(y @ R) - I_k)^2); centered; denominator B-1",
+                "weight": cfg.covariance.weight, "sketch_dim": cfg.covariance.sketch_dim,
+                "projection": "orthonormal columns; fresh each step; shared between views",
+                "precision": "float32; autocast disabled",
+                "gaussian_expected_value": gaussian_covariance_expected_value(
+                    cfg.optim.batch_size, cfg.covariance.sketch_dim),
+            }
+
+    def covariance_term(self, views, diagnostics):
+        """One independent sketch per step, separate centering for each view."""
+        projection = sample_orthonormal_sketch(
+            self.cfg.model.d_latent, self.cfg.covariance.sketch_dim,
+            self.covariance_generator, self.device)
+        terms = [sketched_covariance_loss(v, projection) for v in views]
+        covariance = sum(terms) / len(terms)
+        weighted = self.cfg.covariance.weight * covariance
+        metrics = {}
+        if diagnostics:
+            metrics = {"covariance": float(covariance.detach()),
+                       "covariance_weighted": float(weighted.detach())}
+            gradients = torch.autograd.grad(weighted, views, retain_graph=True)
+            for name, term, gradient in zip(("full", "masked"), terms, gradients):
+                metrics[f"covariance_{name}"] = float(term.detach())
+                metrics[f"grad_rms_y/{name}/covariance_weighted"] = rms(gradient)
+        return weighted, metrics
 
     def loss(self, h, diagnostics):
         if not self.cfg.masking.enabled:
@@ -113,9 +147,12 @@ class MaskedTrainer(Trainer):
         sigreg = (terms[0] + terms[1]) / 2
         weighted = self.cfg.sigreg.weight * sigreg
         loss = consistency + weighted
+        metrics = {}
+        if self.covariance_generator is not None:
+            cov_weighted, metrics = self.covariance_term((y, masked), diagnostics)
+            loss = loss + cov_weighted
         if not torch.isfinite(loss):
             raise ValueError("nonfinite masked consistency loss")
-        metrics = {}
         if diagnostics:
             for name, term in [("consistency", consistency), ("sigreg_weighted", weighted)]:
                 gradients = torch.autograd.grad(term, (y, masked), retain_graph=True)
@@ -137,24 +174,30 @@ class MaskedTrainer(Trainer):
         with autocast_context(self.device, self.amp_dtype):
             y = self.model.encode_dense(h)
         sigreg = self.sigreg(y)
-        loss = self.cfg.sigreg.weight * sigreg
+        weighted = self.cfg.sigreg.weight * sigreg
+        loss = weighted
+        metrics = {}
+        if self.covariance_generator is not None:
+            cov_weighted, metrics = self.covariance_term((y,), diagnostics)
+            loss = loss + cov_weighted
         if not torch.isfinite(loss):
             raise ValueError("nonfinite SIGReg-only loss")
-        metrics = {}
         if diagnostics:
-            gradient = torch.autograd.grad(loss, y, retain_graph=True)[0]
+            gradient = torch.autograd.grad(weighted, y, retain_graph=True)[0]
             yf = y.detach().float()
-            metrics = {"loss": float(loss.detach()), "sigreg": float(sigreg.detach()),
-                       "sigreg_full": float(sigreg.detach()), "sigreg_weighted": float(loss.detach()),
+            metrics.update({"loss": float(loss.detach()), "sigreg": float(sigreg.detach()),
+                       "sigreg_full": float(sigreg.detach()), "sigreg_weighted": float(weighted.detach()),
                        "grad_rms_y/full/sigreg_weighted": rms(gradient),
                        "full/mean_sq_per_dim": float(yf.mean(0).square().mean()),
-                       "full/variance_mean": float(yf.var(0, unbiased=False).mean())}
+                       "full/variance_mean": float(yf.var(0, unbiased=False).mean())})
         return loss, metrics
 
     def checkpoint_state(self):
         state = super().checkpoint_state()
         state["architecture_id"] = ARCHITECTURE_ID
         state["rng"]["mask"] = self.mask_generator.get_state()
+        if self.covariance_generator is not None:
+            state["rng"]["covariance"] = self.covariance_generator.get_state()
         if self.input_whitening is not None:
             state['input_whitening'] = self.input_whitening
         return state
@@ -172,8 +215,14 @@ class MaskedTrainer(Trainer):
                     raise ValueError('cannot resume: input whitening statistics changed')
             if saved['epsilon'] != self.input_whitening['epsilon']:
                 raise ValueError('cannot resume: input whitening epsilon changed')
+        if (self.covariance_generator is not None and
+                state.get("config", {}).get("covariance", {}).get("weight", 0) > 0 and
+                "covariance" not in state.get("rng", {})):
+            raise ValueError("covariance RNG state missing from checkpoint")
         super().load_checkpoint(path)
         self.mask_generator.set_state(state["rng"]["mask"])
+        if self.covariance_generator is not None:
+            self.covariance_generator.set_state(state["rng"]["covariance"])
 
     def validate(self, detailed=False, split="validation"):
         batches = self.cfg.eval.batches if detailed else self.cfg.train.validation_batches
@@ -204,6 +253,12 @@ def _evaluate(model, source, cfg, device, split, detailed, batches, norm_diagnos
         projections["diagnostic_"] = fixed_projections(d, ec.diagnostic_projections,
                                                       ec.diagnostic_seed, "diagnostic").to(device)
     names = ("gaussian", "masked", "reference") if cfg.masking.enabled else ("gaussian", "reference")
+    cov_projection = None
+    cov_totals = {name: 0.0 for name in names}
+    if cfg.covariance.weight > 0:
+        cov_projection = sample_orthonormal_sketch(
+            d, cfg.covariance.sketch_dim,
+            torch.Generator().manual_seed(cfg.covariance.validation_seed), device)
     # Training-time validation tracks output rank too; the reference spectrum is fixed.
     moments = {name: _Moments(d, device, covariance=detailed or (
         ec.training_covariance and name != "reference")) for name in names}
@@ -240,6 +295,8 @@ def _evaluate(model, source, cfg, device, split, detailed, batches, norm_diagnos
             if not torch.isfinite(v).all():
                 raise ValueError("nonfinite evaluation representation")
             moments[name].add(v)
+            if cov_projection is not None:
+                cov_totals[name] += float(sketched_covariance_loss(v, cov_projection))
             for test in tests[name].values():
                 test.add(v)
             if detailed:
@@ -261,6 +318,14 @@ def _evaluate(model, source, cfg, device, split, detailed, batches, norm_diagnos
         del result["consistency/mse"]
         del result["mask_validation_seed"]
     spectra = {}
+    if cov_projection is not None:
+        result.update({"covariance_weight": cfg.covariance.weight,
+                       "covariance_sketch_dim": cfg.covariance.sketch_dim,
+                       "covariance_validation_seed": cfg.covariance.validation_seed,
+                       "covariance_gaussian_expected_value": gaussian_covariance_expected_value(
+                           ec.batch_size, cfg.covariance.sketch_dim)})
+        for name in names:
+            result[f"{name}/sketched_covariance"] = cov_totals[name] / count
     result['input_transform'] = 'zca' if hasattr(model, 'whitening_matrix') else 'scalar'
     if hasattr(model, 'whitening_matrix'):
         result['input_whitening_epsilon'] = model.whitening_epsilon
@@ -311,12 +376,13 @@ def report(run_root):
         subset = [(p, r) for p, r in rows if r["split"] == split]
         lines = [f"# Masked stage 1: {split}", "",
                  "Full input is the downstream representation. Compare both views against the finite-sample Gaussian reference. No reconstruction decoder/FVU is available.", "",
-                 "| run | objective | mask | lambda | consistency | SIGReg full | masked | ref | effective rank full | masked | ref |",
-                 "|---|---|---|---|---|---|---|---|---|---|---|"]
+                 "| run | objective | mask | lambda | beta | sketch k | consistency | SIGReg full | masked | ref | effective rank full | masked | ref |",
+                 "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
         fig, axes = plt.subplots(1, 2, figsize=(12, 4), squeeze=False)
         for path, row in subset:
             label = f"{row.get('run_name', path.parent.name)} step={row.get('step', '?')}"
-            keys = ["mask_probability", "sigreg_weight", "consistency/mse", "gaussian/heldout_sigreg",
+            keys = ["mask_probability", "sigreg_weight", "covariance_weight", "covariance_sketch_dim",
+                    "consistency/mse", "gaussian/heldout_sigreg",
                     "masked/heldout_sigreg", "reference/heldout_sigreg", "gaussian/cov_effective_rank",
                     "masked/cov_effective_rank", "reference/cov_effective_rank"]
             lines.append("| " + label + " | " + row["objective"] + " | " + " | ".join(f"{row[k]:.6g}" if k in row else "" for k in keys) + " |")
