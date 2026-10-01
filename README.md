@@ -302,3 +302,13 @@ Covariances/eigendecompositions run on `--device`; models are processed one at a
 time. `--device cpu` works for small checks but full-dimensional eigenspectra can
 be slow. A quick smoke run is `--batches 4 --projections 32 --seeds 901
 --trim-fractions 0.001`; use the larger default sample for scientific conclusions.
+
+### Verify the origin of large activation norms
+
+`sj-verify-activations` consumes the paired norm diagnostics from `sj-masked`.
+It traces outliers and ordinary/same-token controls to stored token IDs, compares
+an independent safetensors read with the training loader, and optionally replays
+the complete token sequence through the original LLM block. Replayed activations,
+storage casting, and new serialization round-trips are checked separately.
+See [the activation verification guide](docs/activation_verification.md) for commands,
+input requirements, and the limits of revision/mask/precision matching.

@@ -19,12 +19,14 @@ dependencies = [
 dev = ["pytest>=8.0"]
 text = ["transformers>=4.40"]
 probe = ["transformers>=4.40,<5", "datasets>=2.19"]
+verify = ["transformers>=4.40,<5", "safetensors>=0.4"]
 
 [project.scripts]
 sj-compute-normalization = "sae_jepa.normalization:main"
 sj-fit-pca = "sae_jepa.normalization:pca_main"
 sj-train-dense = "sae_jepa.train:main"
 sj-masked = "sae_jepa.masked:main"
+sj-verify-activations = "sae_jepa.verify_activations:main"
 sj-evaluate-dense = "sae_jepa.evaluate:main"
 sj-diagnose-dense = "sae_jepa.diagnose:main"
 sj-stage2 = "sae_jepa.stage2:main"

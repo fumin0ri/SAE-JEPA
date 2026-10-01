@@ -111,6 +111,9 @@ sj-masked evaluate --checkpoint "$run_dir/checkpoints/latest.pt" \
 元の評価値・乱数列は変えず、activation全体を保持しないため追加メモリはサンプル数に比例します。
 現在のCLIのsplitはvalidation/testです。train分布の診断はこの機能には含みません。
 
+巨大ノルムの元トークン、保存値とloaderの一致、元LLMでの再計算は
+[activation検証手順](activation_verification.md)の`sj-verify-activations`を使用します。
+
 ### SIGReg単体の切り分け
 
 `configs/sigreg_only.yaml`は`masking.enabled=false`とし、full入力のSIGRegだけで
