@@ -71,6 +71,46 @@ sj-masked report --run-root runs/masked-single
 
 ## 指標と読み方
 
+### 同じサンプルの入力・出力ノルムを調べる
+
+既存checkpointを再学習せず、評価時に `--norm-diagnostics` を追加します。
+maskedとSIGReg-onlyの両方に対応しています。
+
+```bash
+run_dir=runs/stage1-sigreg-only-100k/seed-42
+sj-masked evaluate --checkpoint "$run_dir/checkpoints/latest.pt" \
+  --split validation --device cuda --norm-diagnostics \
+  --norm-outlier-fraction 0.01 \
+  --output "$run_dir/eval-validation-norms.json"
+```
+
+通常の評価JSON・spectraに加えて、次を保存します。
+
+- `eval-validation-norms-norm-samples.jsonl`: 全評価サンプルの対応表。
+  `h_sqnorm_per_dim` は生activation、`x_sqnorm_per_dim` はtrain平均・共通スカラー
+  で正規化した入力、`y_sqnorm_per_dim` はfull出力の二乗ノルム/各ベクトルの次元。
+  masked学習の場合は `masked_x_sqnorm_per_dim` と `masked_y_sqnorm_per_dim` も保存。
+  `sample_index` は評価順、`entry` はsplitのshard一覧へのindex、`shard` はmanifest内のentry、
+  `sequence` と `position` はshard内のsequence indexとその中のtoken位置（0始まり）。
+  token文字列やIDの復元は行いません。
+- `eval-validation-norms-norm-summary.json`: Pearson/Spearman相関、出力上位1%と
+  入力上位1%の重なり、出力上位群/残りの入力・出力ノルム分布、上位32件の対応表、
+  エネルギー比、上位群が全出力二乗ノルム総和に占める割合、評価条件を保存。
+
+相関は二乗ノルム/次元に対するものです。Spearmanは同順位を平均順位として扱い、
+一定値の列の相関はnullです。上位件数はceil(N×fraction)（最低1件、最大N−1件）で、
+同じノルムではsample_indexの小さい順に選びます。
+`y_over_x_energy_ratio` は `(||y||²/d_latent)/(||x||²/d_in)` です。
+入力0の場合はnullとし、比の集計から除外して件数を記録します。
+非線形モデルの作用素ノルムではありません。出力上位サンプルの入力も巨大か、
+通常の入力が出力で増幅されたかを確認するための指標です。
+
+`--norm-outlier-fraction` は対応診断の群分けにだけ使います。
+共分散のtrim率は従来どおり `--set eval.outlier_fraction=0.01` で別途指定します。
+診断は同じ評価forwardからスカラーだけを収集し、追加のmask生成やサンプリングをしません。
+元の評価値・乱数列は変えず、activation全体を保持しないため追加メモリはサンプル数に比例します。
+現在のCLIのsplitはvalidation/testです。train分布の診断はこの機能には含みません。
+
 ### SIGReg単体の切り分け
 
 `configs/sigreg_only.yaml`は`masking.enabled=false`とし、full入力のSIGRegだけで

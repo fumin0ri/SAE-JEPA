@@ -125,17 +125,18 @@ class MaskedTrainer(Trainer):
 
 
 @torch.no_grad()
-def evaluate_masked(model, source, cfg, device, *, split="validation", detailed=True, batches=None):
+def evaluate_masked(model, source, cfg, device, *, split="validation", detailed=True, batches=None,
+                    norm_diagnostics=None):
     """Fixed evaluation masks/directions, full and masked covariance, no fake FVU."""
     was_training = model.training
     model.eval()
     try:
-        return _evaluate(model, source, cfg, device, split, detailed, batches)
+        return _evaluate(model, source, cfg, device, split, detailed, batches, norm_diagnostics)
     finally:
         model.train(was_training)
 
 
-def _evaluate(model, source, cfg, device, split, detailed, batches):
+def _evaluate(model, source, cfg, device, split, detailed, batches, norm_diagnostics):
     ec, sc, d = cfg.eval, cfg.sigreg, cfg.model.d_latent
     masks = torch.Generator().manual_seed(cfg.masking.validation_seed)
     reference = torch.Generator().manual_seed(ec.gaussian_reference_seed)
@@ -155,12 +156,19 @@ def _evaluate(model, source, cfg, device, split, detailed, batches):
     tops = {name: _TopRows(ec.outlier_buffer, d, device) for name in names} if detailed else {}
     norms = {name: [] for name in names}
     n, count, consistency_sse = 0, 0, 0.0
-    for h in eval_batches(source, split, ec.batch_size,
-                         ec.batches if batches is None else batches, seed=ec.sample_seed):
+    for item in eval_batches(source, split, ec.batch_size,
+                            ec.batches if batches is None else batches, seed=ec.sample_seed,
+                            with_metadata=norm_diagnostics is not None):
+        h, metadata = item if norm_diagnostics is not None else (item, None)
         with autocast_context(device, cfg.optim.amp_dtype):
             full = model(h.to(device))
             if cfg.masking.enabled:
-                masked = model.encode_normalized(mask_coordinates(full["x"], cfg.masking.probability, masks))
+                masked_x = mask_coordinates(full["x"], cfg.masking.probability, masks)
+                masked = model.encode_normalized(masked_x)
+        if norm_diagnostics is not None:
+            norm_diagnostics.add(h, full["x"], full["y"], metadata, source.paths(split),
+                                 masked_x=masked_x if cfg.masking.enabled else None,
+                                 masked_y=masked if cfg.masking.enabled else None)
         values = {"gaussian": full["y"].float(),
                   "reference": torch.randn(len(h), d, generator=reference).to(device)}
         if cfg.masking.enabled:
@@ -279,6 +287,10 @@ def main(argv=None):
     evaluate.add_argument("--device", default="cuda")
     evaluate.add_argument("--activation-manifest")
     evaluate.add_argument("--output")
+    evaluate.add_argument("--norm-diagnostics", action="store_true",
+                          help="write paired raw/normalized input and output norms per sample")
+    evaluate.add_argument("--norm-outlier-fraction", type=float, default=.01,
+                          help="top output-norm fraction for paired diagnostics (default .01)")
     evaluate.add_argument("--set", action="append", default=[], help="eval.* overrides only")
     args = parser.parse_args(argv)
     if args.command == "report":
@@ -318,11 +330,23 @@ def main(argv=None):
     if source.fingerprint != state["data_manifest"]["fingerprint"] or source.splits != state["data_manifest"]["splits"]:
         raise ValueError("evaluation data differs from training data/splits")
     check_normalization_matches(state["normalization"], source)
-    results = evaluate_masked(model.to(device), source, cfg, device, split=args.split)
+    from .norm_diagnostics import NormDiagnostics
+    diagnostic = NormDiagnostics(args.norm_outlier_fraction) if args.norm_diagnostics else None
+    results = evaluate_masked(model.to(device), source, cfg, device, split=args.split,
+                              norm_diagnostics=diagnostic)
     results.update({"checkpoint": args.checkpoint, "step": state["step"], "seed": cfg.train.seed,
                     "sigreg_weight": cfg.sigreg.weight, "run_name": cfg.name})
     output = Path(args.output) if args.output else Path(args.checkpoint).parent.parent / f"eval-{args.split}-step-{state['step']:07d}.json"
     output.parent.mkdir(parents=True, exist_ok=True)
+    if diagnostic is not None:
+        results["norm_diagnostics"] = diagnostic.write(output, {
+            "checkpoint": str(args.checkpoint), "step": state["step"], "split": args.split,
+            "activation_manifest": str(args.activation_manifest or cfg.data.activation_manifest),
+            "data_fingerprint": source.fingerprint, "sample_seed": cfg.eval.sample_seed,
+            "batch_size": cfg.eval.batch_size, "batches": results["batches"],
+            "masking_enabled": cfg.masking.enabled, "mask_probability": results["mask_probability"],
+            "mask_validation_seed": cfg.masking.validation_seed if cfg.masking.enabled else None,
+            "amp_dtype": cfg.optim.amp_dtype})
     write_evaluation(results, output)
     print(f"{args.split}: objective={results['objective']}, "
           f"SIGReg full={results['gaussian/heldout_sigreg']:.3f}")
