@@ -33,6 +33,11 @@ class ModelConfig:
     d_hidden: int = 4096
     d_latent: int = 4096
     activation: str = "gelu"
+    # masked_sigreg_encoder only.  > 0: after building (and whitening) the
+    # encoder, rescale and center its last Linear layer on held-aside train rows
+    # so the initial output has this mean per-dimension variance and zero mean.
+    # 0 keeps PyTorch's default initialization (the original behavior).
+    init_output_variance: float = 0.0
 
 
 @dataclass
@@ -82,6 +87,10 @@ class TrainConfig:
 @dataclass
 class EvalConfig:
     input_diagnostics: bool = False  # covariance of the actual encoder input
+    # Masked/SIGReg-only encoder: also accumulate the output covariance during
+    # periodic training validation (and at step 0), so effective rank and
+    # participation ratio are logged over training, not only at the end.
+    training_covariance: bool = True
     split: str = "validation"
     batch_size: int = 512  # same N as training so SIGReg values are comparable
     # Evaluation batches are a fixed random sample of positions drawn from the
@@ -140,6 +149,10 @@ class ExperimentConfig:
             raise ValueError("masking.probability must lie strictly between 0 and 1")
         if self.model.type == "masked_sigreg_encoder" and not self.sigreg.weight > 0:
             raise ValueError("masked consistency requires sigreg.weight > 0 to oppose collapse")
+        if self.model.init_output_variance < 0:
+            raise ValueError("model.init_output_variance must be non-negative")
+        if self.model.init_output_variance > 0 and self.model.type != "masked_sigreg_encoder":
+            raise ValueError("model.init_output_variance requires model.type=masked_sigreg_encoder")
         if self.sigreg.weight < 0:
             raise ValueError("sigreg.weight must be non-negative")
         if self.data.skip_leading_positions < 0:

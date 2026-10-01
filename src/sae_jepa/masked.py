@@ -23,12 +23,42 @@ from .sigreg import epps_pulley_sigreg, fixed_projections, gaussian_expected_val
 from .train import Trainer, autocast_context, resolve_device, rms
 
 ARCHITECTURE_ID = "masked_sigreg_encoder_v1"
+OUTPUT_INIT_SEED_OFFSET = 3_000_017
+OUTPUT_INIT_BATCHES = 8
 
 
 def mask_coordinates(x, probability, generator):
     """Dedicated CPU RNG keeps masks independent of model/data/projection RNGs."""
     keep = torch.rand(x.shape, generator=generator) >= probability
     return x * keep.to(device=x.device, dtype=x.dtype)
+
+
+@torch.no_grad()
+def calibrate_output_layer(model, source, cfg, device):
+    """Rescale and center the encoder's last Linear so y has the target variance.
+
+    Uses a fixed sample of train rows drawn with its own seed, so the training
+    data order, the model RNG and all other generators are untouched.  The new
+    output is ``gain * (y - mean(y))``: the spectrum shape of the default
+    initialization is kept, only its overall scale and mean change.
+    """
+    target = cfg.model.init_output_variance
+    rows = torch.cat(list(eval_batches(
+        source, "train", cfg.eval.batch_size, OUTPUT_INIT_BATCHES,
+        seed=mix_seed(cfg.train.seed, OUTPUT_INIT_SEED_OFFSET), allow_train=True)))
+    y = model.encode_dense(rows.to(device)).double()
+    mean = y.mean(0)
+    variance = float(y.var(0, unbiased=False).mean())
+    if not variance > 0:
+        raise ValueError("cannot calibrate the output layer: initial output has zero variance")
+    gain = math.sqrt(target / variance)
+    last = model.encoder[-1]
+    last.weight.mul_(gain)
+    last.bias.copy_((gain * (last.bias.double() - mean)).to(last.bias.dtype))
+    return {"target_variance": target, "initial_variance_mean": variance,
+            "initial_mean_sq_per_dim": float(mean.square().mean()), "gain": gain,
+            "samples": len(rows), "centered": True,
+            "sampling": "fixed train sample, dedicated seed; training order unchanged"}
 
 
 class MaskedTrainer(Trainer):
@@ -42,6 +72,10 @@ class MaskedTrainer(Trainer):
             self.input_whitening = torch.load(cfg.data.input_whitening_path, map_location='cpu', weights_only=False)
             validate(self.input_whitening, self.source, self.normalization)
             install(self.model, self.input_whitening)
+        self.output_init = None
+        if cfg.model.init_output_variance > 0:
+            # After whitening: the calibration must see the actual encoder input.
+            self.output_init = calibrate_output_layer(self.model, self.source, cfg, self.device)
         self.mask_generator = torch.Generator().manual_seed(
             mix_seed(cfg.train.seed, cfg.masking.seed_offset)
         )
@@ -59,6 +93,8 @@ class MaskedTrainer(Trainer):
         if self.input_whitening is not None:
             self.convention['input_whitening'] = {k: self.input_whitening[k] for k in
                 ('epsilon', 'count', 'sampling', 'convention')}
+        if self.output_init is not None:
+            self.convention['output_init'] = self.output_init
 
     def loss(self, h, diagnostics):
         if not self.cfg.masking.enabled:
@@ -168,7 +204,9 @@ def _evaluate(model, source, cfg, device, split, detailed, batches, norm_diagnos
         projections["diagnostic_"] = fixed_projections(d, ec.diagnostic_projections,
                                                       ec.diagnostic_seed, "diagnostic").to(device)
     names = ("gaussian", "masked", "reference") if cfg.masking.enabled else ("gaussian", "reference")
-    moments = {name: _Moments(d, device, covariance=detailed) for name in names}
+    # Training-time validation tracks output rank too; the reference spectrum is fixed.
+    moments = {name: _Moments(d, device, covariance=detailed or (
+        ec.training_covariance and name != "reference")) for name in names}
     tests = {name: {key: _ProjectionDiagnostics(
         a, t, weights, sc.scale_by_batch_size,
         tuple(ec.quantiles) if key == "diagnostic_" else None,

@@ -94,3 +94,51 @@ checkpointと同じであることを確認し、異なれば停止します。�
 scalar条件のxとzca条件のxは異なる座標変換後の量であることに注意してください。
 
 whiteningによって出力の等方性が改善しても、情報保存・SAE/probe性能の改善は別の検証です。
+
+## 学習中の出力ランク記録と、出力分散の初期化
+
+### 学習中のPR・有効ランク
+
+masked / SIGReg-onlyエンコーダの学習中validation（`train.validation_every`ごと）でも、
+出力の共分散を集計します。`metrics.jsonl`の`validation`に次が入ります。
+
+- `gaussian/cov_effective_rank`, `gaussian/cov_participation_ratio`,
+  `gaussian/cov_eig_max`, `gaussian/cov_eig_min`, `gaussian/cov_fro_dev` など
+- mask有効時は`masked/cov_*`も同様
+- Gaussian参照は固定なので学習中には共分散を計算しません
+
+集計は`train.validation_batches`分（既定16 batch = 8,192件）です。最終評価（64 batch）より
+件数が少ないので、絶対値ではなく推移の比較に使ってください。新規学習では
+**step 0（初期化直後、更新前）にもvalidationを1回記録**します。
+`eval.training_covariance=false`で無効化できます（再開時に変更可能）。
+
+### `model.init_output_variance`
+
+既定の初期化では、SIGReg-onlyの初期出力分散が約0.035と小さく、学習初期は
+スケールを上げる勾配が支配的になります。`model.init_output_variance=1.0`を指定すると、
+エンコーダ構築後（ZCA使用時はwhitening適用後）に、最後のLinear層を次のように変更します。
+
+```text
+y0 = G(x)                       既定初期化の出力
+y  = gain * (y0 - mean(y0))     gain = sqrt(target / mean_per_dim_var(y0))
+```
+
+- 推定には、train splitから専用seedで抽出した固定サンプル（8 batch × `eval.batch_size`）を使います。
+  学習のデータ順序・モデル・SIGReg・maskの乱数は変わりません。
+- 第1層は変えません。初期出力の固有値スペクトルの**形**は既定初期化と同じで、
+  全体スケールと平均だけが変わります。
+- `gain`・推定前の分散・件数は`sigreg_convention.json`の`output_init`に保存されます。
+- 既定値0は従来の初期化です。旧checkpointの再開挙動は変わりません。
+
+比較スクリプトは、ZCA入力で既定初期化と出力分散1初期化の2条件を学習します。
+
+```bash
+ACTIVATION_MANIFEST=/path/to/manifest.json \
+NORMALIZATION=runs/stage1-masked-100k/normalization.pt \
+INPUT_WHITENING=runs/input-whitening/train-zca-262144-eps1e-4.pt \
+bash scripts/stage1_output_init_compare.sh
+```
+
+`DECAY_FRACTION`（既定0.5）、`INIT_VARIANCE`（既定1.0）、`STEPS`、`SEED`、`RUN_ROOT`で
+条件を変更できます。step 0の有効ランクがどちらも同程度（約1,900）で、既定初期化だけが
+学習初期に大きく下がるなら、ランク低下は初期のスケール上げ段階で生じていると判断できます。

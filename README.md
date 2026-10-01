@@ -320,3 +320,7 @@ on train activations only. `scripts/stage1_input_whitening_compare.sh` compares
 scalar-normalized and whitened inputs with identical initialization and training
 settings. See [the input whitening guide](docs/input_whitening.md) for the fit,
 training, checkpoint, and input-covariance diagnostics workflow.
+`scripts/stage1_output_init_compare.sh` compares the default initialization with
+`model.init_output_variance=1.0` (last layer rescaled and centered to unit output
+variance at step 0) on whitened input. Masked/SIGReg-only training validation logs
+output effective rank and participation ratio from step 0 onward.

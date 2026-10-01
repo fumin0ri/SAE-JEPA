@@ -385,6 +385,10 @@ class Trainer:
         stop = cfg.optim.steps if max_steps is None else min(cfg.optim.steps, max_steps)
         started = time.time()
         with log_path.open("a", encoding="utf-8") as log:
+            if self.step == 0 and cfg.train.validation_every > 0:
+                # The initialization is the baseline for how training changes the spectrum.
+                log.write(json.dumps({"validation": self.validate(detailed=False), "step": 0}) + "\n")
+                log.flush()
             while self.step < stop:
                 upcoming = self.step + 1
                 diagnostics = upcoming == 1 or upcoming % cfg.train.log_every == 0 or upcoming == cfg.optim.steps

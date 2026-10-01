@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import pytest
 import torch
@@ -169,3 +170,79 @@ def test_sigreg_only_config():
     cfg = load_config(Path(__file__).parents[1] / "configs/sigreg_only.yaml")
     assert cfg.masking.enabled is False
     assert cfg.sigreg.weight == 1.0
+
+
+def sigreg_only_config(manifest, path):
+    cfg = config(manifest, path)
+    cfg.masking.enabled = False
+    cfg.sigreg.weight = 1.0
+    return cfg
+
+
+def test_output_calibration_rescales_and_centers_only_the_last_layer(manifest, tmp_path):
+    from sae_jepa.data import eval_batches, mix_seed
+    from sae_jepa.masked import OUTPUT_INIT_BATCHES, OUTPUT_INIT_SEED_OFFSET
+
+    base = MaskedTrainer(sigreg_only_config(manifest, tmp_path / "base"))
+    cfg = sigreg_only_config(manifest, tmp_path / "calibrated")
+    cfg.model.init_output_variance = 1.0
+    calibrated = MaskedTrainer(cfg)
+    info = calibrated.output_init
+    assert base.output_init is None and "output_init" not in base.convention
+    assert calibrated.convention["output_init"] == info
+    assert info["samples"] == OUTPUT_INIT_BATCHES * cfg.eval.batch_size and info["gain"] > 0
+    first, last = calibrated.model.encoder[0], calibrated.model.encoder[-1]
+    assert torch.equal(first.weight, base.model.encoder[0].weight)
+    assert torch.equal(first.bias, base.model.encoder[0].bias)
+    torch.testing.assert_close(last.weight, info["gain"] * base.model.encoder[-1].weight)
+    rows = torch.cat(list(eval_batches(
+        calibrated.source, "train", cfg.eval.batch_size, OUTPUT_INIT_BATCHES,
+        seed=mix_seed(cfg.train.seed, OUTPUT_INIT_SEED_OFFSET), allow_train=True)))
+    with torch.no_grad():
+        y = calibrated.model.encode_dense(rows).double()
+    assert float(y.var(0, unbiased=False).mean()) == pytest.approx(1.0, rel=1e-4)
+    assert float(y.mean(0).abs().max()) < 1e-4
+    assert base.data.state_dict() == calibrated.data.state_dict()
+
+
+def test_output_calibration_resumes_exactly(manifest, tmp_path):
+    def make(path):
+        cfg = sigreg_only_config(manifest, path)
+        cfg.model.init_output_variance = 1.0
+        return MaskedTrainer(cfg)
+
+    straight = make(tmp_path / "straight")
+    straight.run()
+    make(tmp_path / "resume").run(max_steps=4)
+    resumed = make(tmp_path / "resume")
+    resumed.load_checkpoint(tmp_path / "resume/checkpoints/latest.pt")
+    resumed.run()
+    for key, value in straight.model.state_dict().items():
+        assert torch.equal(value, resumed.model.state_dict()[key]), key
+
+
+def test_output_calibration_config_is_checked():
+    with pytest.raises(ValueError, match="init_output_variance"):
+        load_config(overrides=["model.init_output_variance=-1"])
+    with pytest.raises(ValueError, match="init_output_variance"):
+        load_config(overrides=["model.type=dense_sigreg_ae", "model.init_output_variance=1"])
+
+
+def test_training_validation_logs_output_rank_from_step_zero(manifest, tmp_path):
+    def validations(cfg):
+        MaskedTrainer(cfg).run()
+        rows = [json.loads(line) for line in
+                (Path(cfg.train.output_dir) / "metrics.jsonl").read_text().splitlines()]
+        return [row for row in rows if "validation" in row]
+
+    logged = validations(sigreg_only_config(manifest, tmp_path / "on"))
+    assert [row["step"] for row in logged] == [0, 4, 8]
+    for row in logged:
+        assert {"gaussian/cov_effective_rank", "gaussian/cov_participation_ratio",
+                "gaussian/cov_eig_max"} <= row["validation"].keys()
+        assert "reference/cov_effective_rank" not in row["validation"]
+    masked = validations(config(manifest, tmp_path / "masked"))
+    assert all("masked/cov_participation_ratio" in row["validation"] for row in masked)
+    cfg = sigreg_only_config(manifest, tmp_path / "off")
+    cfg.eval.training_covariance = False
+    assert all("gaussian/cov_effective_rank" not in row["validation"] for row in validations(cfg))
