@@ -66,8 +66,15 @@ def test_macro_aggregation_distinguishes_datasets():
     assert r['dataset_macro_accuracy'] == .5 and r['task_macro_accuracy'] == .75
 
 
-def test_offline_checkpoint_probe_end_to_end(manifest, tmp_path):
+@pytest.mark.parametrize('frontend_kind', ['dense', 'raw', 'zca'])
+def test_offline_checkpoint_probe_end_to_end(manifest, tmp_path, frontend_kind):
     t = Trainer(tiny_config(manifest, tmp_path/'front', steps=1)); front = t.save_checkpoint()
+    if frontend_kind != 'dense':
+        from sae_jepa.stage2 import main as stage2_main
+        stage2_main(['prepare-baselines', '--reference-checkpoint', str(front),
+                     '--output', str(tmp_path/'baselines'), '--kinds', frontend_kind,
+                     '--maximum-positions', '64'])
+        front = tmp_path/'baselines'/f'{frontend_kind}.pt'
     cfg = Stage2Config(dictionary_size=16,k=4,steps=1,batch_size=16,amp_dtype='none',
                        calibration_batches=1,eval_batch_size=16,eval_batches=1)
     trainer = Stage2Trainer(front, tmp_path/'stage2', cfg, 'cpu')
@@ -96,6 +103,9 @@ def test_offline_checkpoint_probe_end_to_end(manifest, tmp_path):
     b=json.loads((tmp_path/'two/model-00.json').read_text())
     assert a == b
     assert 'test' not in a['aggregate'] and (tmp_path/'one/summary.md').exists()
+    if frontend_kind != 'dense':
+        assert a['frontend_type'] == frontend_kind
+        assert a['frontend_name'] in (tmp_path/'one/summary.md').read_text()
     after = torch.load(checkpoint,weights_only=False)['sae']
     assert all(torch.equal(before[k],after[k]) for k in before)
 

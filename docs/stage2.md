@@ -1,5 +1,9 @@
 # 第2段階：固定したDense前段とTop-K SAEの比較
 
+**Raw / ZCA baselineとの比較**は[baselines.md](baselines.md)を参照してください。
+`prepare-baselines`で作った前段を以下の`--checkpoints`に渡せます。
+意味特徴の評価ではsparse probeのTop-1を主指標とし、以下のFVUは再構成の比較指標です。
+
 既存のλ=0 / 0.0003 / 0.001のcheckpointを使う小規模比較です。
 第1段階の再学習と全データの正規化再計算は不要です。
 

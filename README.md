@@ -9,7 +9,7 @@
 LLM残差ストリームに対し、**Top-K SAEの前段として「再構成＋SIGReg」で密なGaussian化表現を作る**ための実験コードです。
 [LeJEPA-SAE](https://github.com/fumin0ri/LeJEPA-SAE)（`extract`、safetensors）と [JEPA-SAE](https://github.com/fumin0ri/JEPA-SAE)（`sr-extract-pile`）の活性抽出フォーマットをそのまま読み込みます。
 
-本リポジトリは **第1段階**（密な前段表現の学習と評価）と、**第2段階のDense checkpoint間Top-K SAE比較**（`sj-stage2`）を実装しています。第2段階では前段のencoder・decoder・正規化を固定し、SAEだけを学習します。Raw・PCA whiteningの前段インターフェースもありますが、今回のstage-2コマンドの対象はDense-AE / Dense-SIGReg-AEです。
+本リポジトリは **第1段階**（密な前段表現の学習と評価）と、**第2段階の固定前段間Top-K SAE比較**（`sj-stage2`）を実装しています。第2段階では前段の変換・逆変換・正規化を固定し、SAEだけを学習します。Dense-AE / Dense-SIGReg-AE / readout付きmasked encoderに加え、**Raw / 全次元ZCA whitening baseline**も同じ学習・評価・sparse probe経路で比較できます。A/Bの作成と実験コマンドは **[docs/baselines.md](docs/baselines.md)** を参照してください。
 
 第2段階の実行・再開・評価方法は **[docs/stage2.md](docs/stage2.md)** を参照してください。
 

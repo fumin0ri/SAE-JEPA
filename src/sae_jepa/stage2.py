@@ -1,4 +1,4 @@
-"""Frozen dense front-end -> Top-K SAE pilot training, evaluation and comparison."""
+"""Frozen Raw/ZCA/learned front-end -> Top-K SAE training and comparison."""
 from __future__ import annotations
 
 import argparse
@@ -101,6 +101,17 @@ def source_for(front, manifest=None):
 
 
 def load_front(path):
+    from .baselines import FORMAT as BASELINE_FORMAT, build_baseline
+
+    state = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
+    if state.get("format") == BASELINE_FORMAT:
+        model = build_baseline(state)
+        state["path"] = str(path)
+        actual_hash = tensor_hash(state["model"])
+        if state.get("sha256") != actual_hash:
+            raise ValueError("baseline front-end checksum mismatch")
+        return model, state
+    del state
     with torch.random.fork_rng(devices=[]):
         model, state = load_checkpoint_model(path, torch.device("cpu"))
     front = {k: state[k] for k in ["config", "data_manifest", "normalization", "model", "step"]}
@@ -114,6 +125,10 @@ def load_front(path):
 
 
 def build_front(front, device):
+    from .baselines import FORMAT as BASELINE_FORMAT, build_baseline
+
+    if front.get("format") == BASELINE_FORMAT:
+        return build_baseline(front).to(device).eval().requires_grad_(False)
     return model_from_checkpoint(front).to(device).eval().requires_grad_(False)
 
 
@@ -422,8 +437,11 @@ def write_report(root, split="validation"):
     x = list(range(len(rows)))
     ax.bar([v - .18 for v in x], [r['frontend']['fvu']*100 for r in rows], width=.36, label="Frontend only")
     ax.bar([v + .18 for v in x], [r['end_to_end']['fvu']*100 for r in rows], width=.36, label="Frontend + Top-K SAE")
-    ax.set_xticks(x, [f"λ={r['frontend_lambda']:g}" + (f"\nβ={r['frontend_covariance_weight']:g}"
-                       if r.get('frontend_covariance_weight') else "") for r in rows])
+    labels = [r.get('frontend_name', r.get('frontend_type', ''))
+              if r.get('frontend_type') in {'raw', 'zca'}
+              else f"λ={r['frontend_lambda']:g}" + (f"\nβ={r['frontend_covariance_weight']:g}"
+                   if r.get('frontend_covariance_weight') else "") for r in rows]
+    ax.set_xticks(x, labels)
     ax.set_ylabel("Original-space FVU (%)"); ax.legend(); fig.tight_layout()
     fig.savefig(report / f"{split}.png", dpi=160); plt.close(fig)
 
@@ -431,6 +449,16 @@ def write_report(root, split="validation"):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
+    p = sub.add_parser("prepare-baselines", help="Create Raw/ZCA front-ends matching a reference checkpoint")
+    p.add_argument("--reference-checkpoint", required=True)
+    p.add_argument("--activation-manifest")
+    p.add_argument("--output", required=True)
+    p.add_argument("--kinds", nargs="+", choices=["raw", "zca"], default=["raw", "zca"])
+    p.add_argument("--epsilon", type=float, default=1e-4)
+    p.add_argument("--maximum-positions", type=int, default=262144)
+    p.add_argument("--chunk-size", type=int, default=2048)
+    p.add_argument("--sample-seed", type=int, default=1729)
+    p.add_argument("--device", default="cpu")
     for name in ["train", "sweep"]:
         p = sub.add_parser(name)
         p.add_argument("--checkpoints", nargs="+", required=True)
@@ -448,6 +476,9 @@ def main(argv=None):
     p.add_argument("--run-root", required=True)
     p.add_argument("--split", choices=["validation", "test"], default="validation")
     args = parser.parse_args(argv)
+    if args.command == "prepare-baselines":
+        from .baselines import prepare
+        return prepare(args)
     if args.command == "report":
         return write_report(args.run_root, args.split)
     if args.command == "evaluate":
@@ -480,7 +511,7 @@ def main(argv=None):
     if root.exists() and any(root.iterdir()):
         if not args.resume or not (root / "comparison.json").exists():
             raise ValueError("comparison output exists; use --resume or a new directory")
-        if json.loads((root / "comparison.json").read_text()) != definition:
+        if json.loads((root / "comparison.json").read_text(encoding="utf-8")) != definition:
             raise ValueError("comparison candidates or settings changed")
     root.mkdir(parents=True, exist_ok=True)
     write_json(root / "comparison.json", definition)

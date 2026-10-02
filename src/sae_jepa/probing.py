@@ -15,7 +15,7 @@ from .data import write_json
 from .evaluate import _autocast
 from .probe_data import (DATASETS, SPLITS, checkpoint_info, collect, file_hash,
                          prepare, read_tasks, text_id)
-from .stage2 import FORMAT, build_front, config, tensor_hash
+from .stage2 import FORMAT, build_front, config, frontend_identity, tensor_hash
 from .topk import TopKSAE
 
 
@@ -179,7 +179,7 @@ def evaluate_checkpoints(args):
         features = pooled_features(state, cache, torch.device(args.device), args.token_batch_size)
         result = {"checkpoint": path, "sae_sha256": tensor_hash(state['sae']),
             "frontend_sha256": tensor_hash(state['frontend']['model']),
-            "frontend_lambda": state['frontend']['config']['sigreg']['weight'],
+            **frontend_identity(state['frontend']),
             "step": state['step'], "tasks": {}}
         for task, items in sorted(grouped.items()):
             result['tasks'][task] = {"dataset": items[0]['dataset'],
@@ -196,12 +196,13 @@ def evaluate_checkpoints(args):
         "models": summary})
     lines = ['# Sparse probing (primary metric: Top-1)', '',
              'Validation selects C. Test is evaluated only with --include-test. No test-based feature selection.', '',
-             '| Model | lambda | split | probe features | Dataset macro accuracy | Task macro accuracy |',
-             '|---|---:|---|---:|---:|---:|']
+             '| Model | Front-end | lambda | beta | split | probe features | Dataset macro accuracy | Task macro accuracy |',
+             '|---|---|---:|---:|---|---:|---:|---:|']
     for i, result in enumerate(summary):
         for split, scores in result['aggregate'].items():
             for k, r in scores.items():
-                lines.append(f"| {i:02d} | {result['frontend_lambda']:g} | {split} | {k} | "
+                lines.append(f"| {i:02d} | {result['frontend_name']} | {result['frontend_lambda']:g} | "
+                             f"{result['frontend_covariance_weight']:g} | {split} | {k} | "
                              f"{r['dataset_macro_accuracy']:.4f} | {r['task_macro_accuracy']:.4f} |")
     (output / 'summary.md').write_text('\n'.join(lines) + '\n', encoding='utf-8')
 

@@ -1,5 +1,8 @@
 # Sparse probing：主目的の評価
 
+Raw / ZCA baselineも同じcheckpoint指定で評価できます。作成・学習は
+[baselines.md](baselines.md)を参照してください。比較表には前段名・λ・βを記録します。
+
 `sj-probe`は既存のstage-2 checkpointを固定し、SAE特徴のTop-1 / Top-2 / Top-5で
 二値分類するprobeを学習します。SAEやLLMの再学習は行いません。
 **主指標はTop-1 accuracy**です。SAE内部のK=64とprobeが使う特徴数は別です。
