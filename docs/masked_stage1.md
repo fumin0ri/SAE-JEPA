@@ -28,6 +28,33 @@ L = mean((y_mask - y_full)^2)
 
 ## 実行
 
+実験環境（`/home/iwasaki`）のactivation manifestは次のパスです。
+他の環境では保存先に合わせて変更してください。
+
+```bash
+export ACTIVATION_MANIFEST=/home/iwasaki/LeJEPA-SAE/data/the-pile/pythia-6.9b/layer-16-ctx1024-100m/manifest.json
+```
+
+このデータでmask率0.1／0.5のStrong SIGReg＋covariance実験を順番に実行する例
+（リポジトリ直下で実行）:
+
+```bash
+RUN_ROOT=runs/masked-cov-beta1 \
+MASK_PROBS="0.1 0.5" WEIGHTS="0.1" \
+STEPS=100000 SEED=42 PARALLEL=1 \
+bash scripts/stage1_masked_sweep.sh \
+  --set covariance.weight=1.0 \
+  --set covariance.sketch_dim=64 \
+  --set model.init_output_variance=1.0 \
+  --set optim.lr=0.00003
+```
+
+上の`export`を同じシェルで先に実行してください。batch512、ZCAなし、初期出力の
+中心化・分散調整ありです。beta=1は探索の出発点です。covなしの対照は
+`RUN_ROOT`を別名にして、`covariance.weight=0`に変更します。
+
+汎用的な実行例:
+
 ```bash
 pip install -e '.[dev]'
 ACTIVATION_MANIFEST=/path/to/manifest.json \
