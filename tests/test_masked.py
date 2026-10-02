@@ -246,3 +246,61 @@ def test_training_validation_logs_output_rank_from_step_zero(manifest, tmp_path)
     cfg = sigreg_only_config(manifest, tmp_path / "off")
     cfg.eval.training_covariance = False
     assert all("gaussian/cov_effective_rank" not in row["validation"] for row in validations(cfg))
+
+
+def test_fit_readout_solves_ridge_and_feeds_stage2(manifest, tmp_path):
+    from sae_jepa.data import eval_batches, mix_seed
+    from sae_jepa.masked import READOUT_SEED_OFFSET
+    from sae_jepa.stage2 import Stage2Trainer, preflight, write_report
+    from test_stage2 import small_config
+
+    cfg = config(manifest, tmp_path / "run")
+    cfg.covariance.weight = 1.0
+    cfg.covariance.sketch_dim = 4
+    trainer = MaskedTrainer(cfg)
+    trainer.run()
+    checkpoint = tmp_path / "run/checkpoints/latest.pt"
+    output = tmp_path / "readout/front.pt"
+    main(["fit-readout", "--checkpoint", str(checkpoint), "--output", str(output),
+          "--device", "cpu", "--batches", "4", "--ridge", "1e-3"])
+    state = torch.load(output, weights_only=False)
+    info = state["readout"]
+    assert "optimizer" not in state and info["samples"] == 4 * cfg.eval.batch_size
+    assert json.loads(output.with_suffix(".json").read_text()) == json.loads(json.dumps(info))
+    rows = torch.cat(list(eval_batches(trainer.source, "train", cfg.eval.batch_size, 4,
+                                       seed=mix_seed(cfg.train.seed, READOUT_SEED_OFFSET),
+                                       allow_train=True)))
+    model = trainer.model.eval()
+    with torch.no_grad():
+        y = model.encode_dense(rows).double()
+    x = ((rows.float() - model.input_mean) / model.input_scale).double()
+    yc, xc = y - y.mean(0), x - x.mean(0)
+    cov_yy, cov_yx = yc.T @ yc / len(y), yc.T @ xc / len(y)
+    penalty = 1e-3 * torch.trace(cov_yy) / y.shape[1]
+    weight = torch.linalg.solve(cov_yy + penalty * torch.eye(y.shape[1], dtype=torch.float64), cov_yx)
+    torch.testing.assert_close(state["model"]["readout.weight"].double(), weight.T, rtol=1e-4, atol=1e-5)
+    fit = y @ weight + (x.mean(0) - y.mean(0) @ weight)
+    assert info["train_fvu"] == pytest.approx(float((fit - x).square().sum() / xc.square().sum()), rel=1e-6)
+    assert 0 < info["validation_fvu"]
+    loaded, _ = load_checkpoint_model(output, torch.device("cpu"))
+    with torch.no_grad():
+        torch.testing.assert_close(loaded.decode_normalized(loaded.encode_dense(rows)).double(),
+                                   fit, rtol=1e-4, atol=1e-4)
+    with pytest.raises(ValueError, match="exists"):
+        main(["fit-readout", "--checkpoint", str(checkpoint), "--output", str(output), "--device", "cpu"])
+    with pytest.raises(ValueError, match="already has a readout"):
+        main(["fit-readout", "--checkpoint", str(output), "--output", str(tmp_path / "again.pt"),
+              "--device", "cpu"])
+    s2 = small_config()
+    assert preflight([output], s2)[0]["covariance_weight"] == 1.0
+    root = tmp_path / "stage2"
+    Stage2Trainer(output, root / "model-00", s2, "cpu").run()
+    result = json.loads((root / "model-00/eval-validation.json").read_text())
+    assert result["frontend_covariance_weight"] == 1.0 and result["frontend_readout"]["samples"] == 64
+    assert result["frontend"]["fvu"] == pytest.approx(info["validation_fvu"], rel=.5)
+    write_report(root)
+    assert "| 1 |" in (root / "report/validation.md").read_text(encoding="utf-8")
+    dense = Trainer(tiny_config(manifest, tmp_path / "dense", steps=2))
+    dense.train_step(False)
+    rows = preflight([dense.save_checkpoint(), output], s2)
+    assert [row["covariance_weight"] for row in rows] == [0.0, 1.0]

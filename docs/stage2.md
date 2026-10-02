@@ -111,3 +111,32 @@ CUDA/bf16の再現性と実機メモリは環境ごとに確認してくださ�
 
 単独学習は`sj-stage2 train --checkpoints PATH --output DIR --config configs/stage2_topk.yaml`。
 Python直接実行は`python -m sae_jepa.stage2 ...`でも同じです。
+
+## masked / SIGReg-onlyエンコーダを前段にする
+
+masked系checkpointにはdecoderがないため、元activation空間のFVUを測れません。
+学習済みエンコーダを固定したまま、線形readoutを閉形式で当てはめてから比較します。
+
+```bash
+sj-masked fit-readout \
+  --checkpoint runs/masked-cov-k256-lam0.01-beta10/mask-0p1-lambda-0p01/seed-42/checkpoints/latest.pt \
+  --output runs/stage2-readout/beta10.pt
+```
+
+- readoutはDense-AEのdecoderと同じ1層Linearで、`y`からtrain統計でscalar正規化した入力へ写します。
+  `W = (Cov_yy + ridge·tr(Cov_yy)/d·I)^-1 Cov_yx`、`b = mean_x - mean_y W`（float64）。
+- 当てはめにはtrain splitから専用seedで抽出した固定サンプルを使います
+  （既定512 batch × `eval.batch_size` = 262,144件、`--batches`で変更）。
+  encoderはStage2と同じautocastで実行します。`--ridge`の既定は1e-4です。
+- 出力は新しいcheckpointです。optimizer状態を含まないので学習再開には使えません。
+  当てはめ条件・train FVU・validation FVUを`state["readout"]`と同名`.json`に保存します。
+  元のcheckpointは変更しません。readout付きcheckpointへの再当てはめは拒否します。
+- 線形readoutのFVUは「線形に取り出せる情報」の量です。Dense-AEのdecoderは
+  encoderと同時に学習されているため、両者のFVU差には目的関数の差と、
+  decoderを後から当てはめたことの差が混ざります。
+
+readout付きcheckpointは`sj-stage2 sweep --checkpoints ...`にそのまま渡せます。
+比較できる条件は、データ・split・先頭除外・入力のscalar正規化・入力次元・潜在次元が
+一致することです。Dense-AE（λ=0など）を同じsweepに入れてbaselineにできます。
+reportにはrun名・λ・covariance weight βを表示し、評価JSONには
+`frontend_type`・`frontend_mask_probability`・`frontend_readout`も保存します。

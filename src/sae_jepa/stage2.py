@@ -12,10 +12,10 @@ import time
 import torch
 import yaml
 
-from .config import _update, config_from_dict, parse_override
+from .config import _update, parse_override
 from .data import DataSource, TrainBatches, eval_batches, write_json
 from .evaluate import _autocast, load_checkpoint_model
-from .models import build_model
+from .models import model_from_checkpoint
 from .normalization import check_normalization_matches
 from .topk import TopKSAE
 from .train import lr_multiplier
@@ -104,6 +104,9 @@ def load_front(path):
     with torch.random.fork_rng(devices=[]):
         model, state = load_checkpoint_model(path, torch.device("cpu"))
     front = {k: state[k] for k in ["config", "data_manifest", "normalization", "model", "step"]}
+    for key in ("input_whitening", "readout"):
+        if key in state:
+            front[key] = state[key]
     front["path"] = str(path)
     front["sha256"] = tensor_hash(front["model"])
     del state
@@ -111,11 +114,20 @@ def load_front(path):
 
 
 def build_front(front, device):
-    cfg = config_from_dict(front["config"])
-    with torch.random.fork_rng(devices=[]):
-        model = build_model(cfg.model, front["normalization"]["mean"], front["normalization"]["scale"])
-    model.load_state_dict(front["model"])
-    return model.to(device).eval().requires_grad_(False)
+    return model_from_checkpoint(front).to(device).eval().requires_grad_(False)
+
+
+def frontend_identity(front):
+    """Labels that distinguish front-ends sharing lambda (e.g. a covariance sweep)."""
+    config = front["config"]
+    return {"frontend_name": config.get("name", ""),
+            "frontend_type": config["model"]["type"],
+            "frontend_lambda": config["sigreg"]["weight"],
+            "frontend_covariance_weight": config.get("covariance", {}).get("weight", 0.0),
+            "frontend_mask_probability": (config.get("masking", {}).get("probability")
+                                          if config["model"]["type"] == "masked_sigreg_encoder"
+                                          and config.get("masking", {}).get("enabled", True) else None),
+            "frontend_readout": front.get("readout")}
 
 
 def check_splits(source, cfg):
@@ -347,7 +359,7 @@ class Stage2Trainer:
         if self.step == self.cfg.steps:
             for split in self.cfg.required_splits:
                 results = evaluate(self.frontend, self.sae, self.calibration, self.source, self.cfg, self.device, split)
-                results.update({"step": self.step, "frontend_lambda": self.front["config"]["sigreg"]["weight"],
+                results.update({"step": self.step, **frontend_identity(self.front),
                     "frontend_sha256": self.front["sha256"], "stage2_config": asdict(self.cfg),
                     "initial_sae_sha256": self.initial_sha256,
                     "train_positions": self.step * self.cfg.batch_size,
@@ -364,12 +376,14 @@ def preflight(checkpoints, cfg, manifest=None):
         source = source_for(front, manifest)
         check_splits(source, cfg)
         identity = {k: source.record()[k] for k in ["fingerprint", "splits", "burn_in_excluded"]}
-        identity["model"] = asdict(model.cfg)
+        # Same input and latent width; the architecture behind encode_dense may differ.
+        identity["model"] = {"d_in": model.cfg.d_in, "d_latent": model.cfg.d_latent}
         identity["normalization"] = tensor_hash({"mean": model.input_mean, "scale": model.input_scale.reshape(1)})
         if baseline is not None and identity != baseline:
             raise ValueError("comparison candidates differ in data, exclusions, dimensions or input normalization")
         baseline = identity
         rows.append({"path": str(path), "lambda": front["config"]["sigreg"]["weight"],
+                     "covariance_weight": front["config"].get("covariance", {}).get("weight", 0.0),
                      "step": front["step"], "sha256": front["sha256"]})
     if len({r["sha256"] for r in rows}) != len(rows):
         raise ValueError("duplicate front-end checkpoint in comparison")
@@ -390,12 +404,14 @@ def write_report(root, split="validation"):
             raise ValueError("refusing report: evaluations do not share sampling, initialization and training budget")
     lines = [f"# Stage 2 ({split})", "", "FVU is in original activation space; latent FVU is reported separately.",
              "Inactive means no positive activation on this evaluation sample, not permanently dead.", "",
-             "| Run | λ | Frontend FVU (%) | End-to-end FVU (%) | Extra FVU (pp) | Latent FVU (%) | Mean L0 | Inactive (%) | Never fired in training (%) |",
-             "|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
+             "Masked front-ends decode through a linear readout fitted after training (frozen encoder).", "",
+             "| Run | Front-end | λ | β | Frontend FVU (%) | End-to-end FVU (%) | Extra FVU (pp) | Latent FVU (%) | Mean L0 | Inactive (%) | Never fired in training (%) |",
+             "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
     compact = []
     for p, r in zip(paths, rows):
         compact.append({k: v for k, v in r.items() if k != "feature_firing_counts"})
-        lines.append(f"| {p.parent.name} | {r['frontend_lambda']:g} | {r['frontend']['fvu']*100:.4f} | "
+        lines.append(f"| {p.parent.name} | {r.get('frontend_name', '')} | {r['frontend_lambda']:g} | "
+                     f"{r.get('frontend_covariance_weight', 0.0):g} | {r['frontend']['fvu']*100:.4f} | "
                      f"{r['end_to_end']['fvu']*100:.4f} | {r['extra_fvu']*100:.4f} | "
                      f"{r['latent']['fvu']*100:.4f} | {r['l0_mean']:.2f} | {r['inactive_fraction']*100:.2f} | "
                      f"{r['train_never_fired_fraction']*100:.2f} |")
@@ -406,7 +422,8 @@ def write_report(root, split="validation"):
     x = list(range(len(rows)))
     ax.bar([v - .18 for v in x], [r['frontend']['fvu']*100 for r in rows], width=.36, label="Frontend only")
     ax.bar([v + .18 for v in x], [r['end_to_end']['fvu']*100 for r in rows], width=.36, label="Frontend + Top-K SAE")
-    ax.set_xticks(x, [f"lambda={r['frontend_lambda']:g}" for r in rows])
+    ax.set_xticks(x, [f"λ={r['frontend_lambda']:g}" + (f"\nβ={r['frontend_covariance_weight']:g}"
+                       if r.get('frontend_covariance_weight') else "") for r in rows])
     ax.set_ylabel("Original-space FVU (%)"); ax.legend(); fig.tight_layout()
     fig.savefig(report / f"{split}.png", dpi=160); plt.close(fig)
 
@@ -444,7 +461,7 @@ def main(argv=None):
             sae = TopKSAE(front.cfg.d_latent, cfg.dictionary_size, cfg.k).to(device)
         sae.load_state_dict(state["sae"])
         results = evaluate(front, sae, state["calibration"], source, cfg, device, args.split)
-        results.update({"step": state["step"], "frontend_lambda": state["frontend"]["config"]["sigreg"]["weight"],
+        results.update({"step": state["step"], **frontend_identity(state["frontend"]),
                         "frontend_sha256": state["frontend"]["sha256"], "stage2_config": asdict(cfg),
                         "initial_sae_sha256": state["initial_sha256"], "train_positions": state["step"] * cfg.batch_size,
                         "train_never_fired_fraction": float((state["firing_counts"] == 0).float().mean())})

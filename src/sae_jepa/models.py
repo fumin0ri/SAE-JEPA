@@ -79,15 +79,45 @@ def build_model(cfg: ModelConfig, mean: torch.Tensor, scale: float) -> nn.Module
     raise ValueError(f"unknown model.type {cfg.type!r}")
 
 
+def model_from_checkpoint(state: dict) -> nn.Module:
+    """Rebuild a stage-1 model, including frozen input whitening and a fitted readout."""
+    from .config import config_from_dict
+
+    cfg = config_from_dict(state["config"])
+    with torch.random.fork_rng(devices=[]):
+        model = build_model(cfg.model, state["normalization"]["mean"], state["normalization"]["scale"])
+    whitening = state.get("input_whitening")
+    if bool(cfg.data.input_whitening_path) != (whitening is not None):
+        raise ValueError("checkpoint input whitening metadata missing or inconsistent")
+    if whitening is not None:
+        from .input_whitening import install
+        install(model, whitening)
+    if isinstance(model, MaskedSIGRegEncoder) and "readout.weight" in state["model"]:
+        model.attach_readout()
+    model.load_state_dict(state["model"])
+    return model
+
+
 class MaskedSIGRegEncoder(DenseSIGRegAE):
-    """Shared full/masked encoder. No reconstruction decoder is trained or saved."""
+    """Shared full/masked encoder. No reconstruction decoder is trained.
+
+    ``sj-masked fit-readout`` can add a linear ``readout`` (same form as the AE
+    decoder) fitted afterwards with the encoder frozen; it maps ``y`` to the
+    scalar-normalized input, so ``denormalize`` returns the original space.
+    """
 
     def __init__(self, cfg: ModelConfig, mean: torch.Tensor, scale: float):
         super().__init__(cfg, mean, scale)
         del self.decoder
 
+    def attach_readout(self) -> nn.Linear:
+        self.readout = nn.Linear(self.cfg.d_latent, self.cfg.d_in).to(self.input_mean.device)
+        return self.readout
+
     def decode_normalized(self, y: torch.Tensor) -> torch.Tensor:
-        raise ValueError("masked encoder has no decoder; fit a frozen-encoder readout first")
+        if not hasattr(self, "readout"):
+            raise ValueError("masked encoder has no decoder; fit a frozen-encoder readout first")
+        return self.readout(y)
 
     def normalize(self, h: torch.Tensor) -> torch.Tensor:
         x = super().normalize(h)

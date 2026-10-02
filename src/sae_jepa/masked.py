@@ -17,9 +17,9 @@ from torch.nn import functional as F
 from .config import config_from_dict, load_config, parse_override, update_config
 from .covariance import (gaussian_covariance_expected_value, sample_orthonormal_sketch,
                          sketched_covariance_loss)
-from .data import DataSource, eval_batches, mix_seed
+from .data import DataSource, eval_batches, mix_seed, write_json
 from .evaluate import (_Moments, _ProjectionDiagnostics, _TopRows, write_evaluation)
-from .models import build_model
+from .models import model_from_checkpoint
 from .normalization import check_normalization_matches
 from .sigreg import epps_pulley_sigreg, fixed_projections, gaussian_expected_value, integration_grid
 from .train import Trainer, autocast_context, resolve_device, rms
@@ -27,6 +27,7 @@ from .train import Trainer, autocast_context, resolve_device, rms
 ARCHITECTURE_ID = "masked_sigreg_encoder_v1"
 OUTPUT_INIT_SEED_OFFSET = 3_000_017
 OUTPUT_INIT_BATCHES = 8
+READOUT_SEED_OFFSET = 5_000_011
 
 
 def mask_coordinates(x, probability, generator):
@@ -61,6 +62,74 @@ def calibrate_output_layer(model, source, cfg, device):
             "initial_mean_sq_per_dim": float(mean.square().mean()), "gain": gain,
             "samples": len(rows), "centered": True,
             "sampling": "fixed train sample, dedicated seed; training order unchanged"}
+
+
+def _readout_rows(source, split, cfg, batches, seed):
+    return eval_batches(source, split, cfg.eval.batch_size, batches, seed=seed,
+                        allow_train=split == "train")
+
+
+@torch.no_grad()
+def fit_linear_readout(model, source, cfg, device, *, batches, ridge, seed):
+    """Closed-form ridge readout y -> scalar-normalized x on a fixed train sample.
+
+    The encoder is frozen and run exactly as stage 2 runs it (same autocast).
+    ``W = (Cov_yy + ridge * tr(Cov_yy)/d I)^-1 Cov_yx``, ``b = mean_x - mean_y W``,
+    accumulated in float64.  FVU is invariant to the scalar normalization, so
+    the reported values equal original-space FVU.
+    """
+    d, d_in = cfg.model.d_latent, cfg.model.d_in
+    options = {"dtype": torch.float64, "device": device}
+    n, sum_xx = 0, 0.0
+    sum_y, sum_x = torch.zeros(d, **options), torch.zeros(d_in, **options)
+    yy, yx = torch.zeros(d, d, **options), torch.zeros(d, d_in, **options)
+    for h in _readout_rows(source, "train", cfg, batches, seed):
+        h = h.to(device)
+        x = ((h.float() - model.input_mean) / model.input_scale).double()
+        with autocast_context(device, cfg.optim.amp_dtype):
+            y = model.encode_dense(h)
+        y = y.double()
+        n += len(h)
+        sum_y += y.sum(0)
+        sum_x += x.sum(0)
+        sum_xx += float(x.square().sum())
+        yy += y.T @ y
+        yx += y.T @ x
+    if n <= d:
+        raise ValueError("readout fit needs more train samples than latent dimensions")
+    mean_y, mean_x = sum_y / n, sum_x / n
+    cov_yy = yy / n - torch.outer(mean_y, mean_y)
+    cov_yx = yx / n - torch.outer(mean_y, mean_x)
+    penalty = ridge * torch.trace(cov_yy) / d
+    weight = torch.linalg.solve(cov_yy + penalty * torch.eye(d, **options), cov_yx)
+    bias = mean_x - mean_y @ weight
+    total = sum_xx / n - float(mean_x.square().sum())
+    explained = float(2 * (weight * cov_yx).sum() - (weight * (cov_yy @ weight)).sum())
+    readout = model.attach_readout()
+    readout.weight.copy_(weight.T.float())
+    readout.bias.copy_(bias.float())
+    return {"form": "linear; y -> (h - mean)/scale", "solver": "closed-form ridge, float64",
+            "ridge": ridge, "ridge_penalty": float(penalty), "samples": n, "split": "train",
+            "seed": seed, "batch_size": cfg.eval.batch_size, "batches": batches,
+            "amp_dtype": cfg.optim.amp_dtype, "train_fvu": (total - explained) / total}
+
+
+@torch.no_grad()
+def readout_fvu(model, source, cfg, device, split, batches, seed):
+    """Original-space FVU of encoder + readout on fixed held-out batches."""
+    n, sse, sum_xx, sum_x = 0, 0.0, 0.0, None
+    for h in _readout_rows(source, split, cfg, batches, seed):
+        h = h.to(device)
+        x = ((h.float() - model.input_mean) / model.input_scale).double()
+        with autocast_context(device, cfg.optim.amp_dtype):
+            x_hat = model.decode_normalized(model.encode_dense(h))
+        sse += float((x_hat.double() - x).square().sum())
+        sum_x = x.sum(0) if sum_x is None else sum_x + x.sum(0)
+        sum_xx += float(x.square().sum())
+        n += len(h)
+    if not n:
+        raise ValueError(f"no full batch for {split}")
+    return sse / (sum_xx - float(sum_x.square().sum()) / n)
 
 
 class MaskedTrainer(Trainer):
@@ -427,6 +496,13 @@ def main(argv=None):
     evaluate.add_argument("--norm-outlier-fraction", type=float, default=.01,
                           help="top output-norm fraction for paired diagnostics (default .01)")
     evaluate.add_argument("--set", action="append", default=[], help="eval.* overrides only")
+    readout = sub.add_parser("fit-readout", help="fit a frozen-encoder linear readout for stage 2")
+    readout.add_argument("--checkpoint", required=True)
+    readout.add_argument("--output", required=True, help="new checkpoint with the readout added")
+    readout.add_argument("--batches", type=int, default=512, help="train batches of eval.batch_size")
+    readout.add_argument("--ridge", type=float, default=1e-4, help="relative to mean latent variance")
+    readout.add_argument("--device", default="cuda")
+    readout.add_argument("--activation-manifest")
     args = parser.parse_args(argv)
     if args.command == "report":
         report(args.run_root)
@@ -447,22 +523,15 @@ def main(argv=None):
     if state.get("architecture_id") != ARCHITECTURE_ID:
         raise ValueError("not a masked encoder checkpoint")
     cfg = config_from_dict(state["config"])
-    for override in args.set:
+    for override in getattr(args, "set", []):
         values = parse_override(override)
         if set(values) != {"eval"}:
             raise ValueError("only eval.* overrides are allowed")
         update_config(cfg, values)
     cfg.validate()
     device = resolve_device(args.device)
-    with torch.random.fork_rng(devices=[]):
-        model = build_model(cfg.model, state["normalization"]["mean"], state["normalization"]["scale"])
     whitening = state.get('input_whitening')
-    if bool(cfg.data.input_whitening_path) != (whitening is not None):
-        raise ValueError('checkpoint input whitening metadata missing or inconsistent')
-    if whitening is not None:
-        from .input_whitening import install
-        install(model, whitening)
-    model.load_state_dict(state["model"])
+    model = model_from_checkpoint(state)
     source = DataSource(args.activation_manifest or cfg.data.activation_manifest,
                         skip_burn_in=cfg.data.skip_burn_in,
                         skip_leading_positions=cfg.data.skip_leading_positions,
@@ -474,6 +543,28 @@ def main(argv=None):
     if whitening is not None:
         from .input_whitening import validate
         validate(whitening, source, state['normalization'])
+    if args.command == "fit-readout":
+        if "readout" in state:
+            raise ValueError("checkpoint already has a readout; start from the training checkpoint")
+        output = Path(args.output)
+        if output.exists():
+            raise ValueError(f"{output} exists; choose a new path")
+        model = model.to(device).eval()
+        seed = mix_seed(cfg.train.seed, READOUT_SEED_OFFSET)
+        info = fit_linear_readout(model, source, cfg, device, batches=args.batches,
+                                  ridge=args.ridge, seed=seed)
+        info["validation_fvu"] = readout_fvu(model, source, cfg, device, "validation",
+                                             cfg.eval.batches, cfg.eval.sample_seed)
+        info["source_checkpoint"] = str(args.checkpoint)
+        # Frozen artifact for stage 2: no optimizer state, so it cannot be resumed by mistake.
+        state = {k: v for k, v in state.items() if k not in {"optimizer", "scheduler"}}
+        state["model"] = {k: v.cpu() for k, v in model.state_dict().items()}
+        state["readout"] = info
+        output.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(state, output)
+        write_json(output.with_suffix(".json"), info)
+        print(f"readout: train FVU={info['train_fvu']:.5f} validation FVU={info['validation_fvu']:.5f}")
+        return
     from .norm_diagnostics import NormDiagnostics
     diagnostic = NormDiagnostics(args.norm_outlier_fraction) if args.norm_diagnostics else None
     results = evaluate_masked(model.to(device), source, cfg, device, split=args.split,

@@ -33,7 +33,7 @@ import torch
 
 from .config import EvalConfig, SIGRegConfig, config_from_dict, parse_override, update_config
 from .data import DataSource, eval_batches, write_json
-from .models import ARCHITECTURE_ID, DenseSIGRegAE, build_model
+from .models import ARCHITECTURE_ID, DenseSIGRegAE, model_from_checkpoint
 from .sigreg import (
     epps_pulley_sigreg,
     fixed_projections,
@@ -484,14 +484,12 @@ def load_checkpoint_model(
 ) -> tuple[DenseSIGRegAE, dict[str, Any]]:
     state = torch.load(Path(path), map_location="cpu", weights_only=False)
     if state.get("config", {}).get("model", {}).get("type") == "masked_sigreg_encoder":
-        raise ValueError("masked encoder has no reconstruction decoder; use sj-masked evaluate")
-    if state.get("architecture_id") != ARCHITECTURE_ID:
+        if "readout" not in state:
+            raise ValueError("masked encoder has no reconstruction decoder; "
+                             "fit one with sj-masked fit-readout (or use sj-masked evaluate)")
+    elif state.get("architecture_id") != ARCHITECTURE_ID:
         raise ValueError(f"unsupported checkpoint {path}")
-    cfg = config_from_dict(state["config"])
-    model = build_model(
-        cfg.model, state["normalization"]["mean"], state["normalization"]["scale"]
-    )
-    model.load_state_dict(state["model"])
+    model = model_from_checkpoint(state)
     return model.to(device).eval(), state
 
 
