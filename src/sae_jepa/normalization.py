@@ -14,6 +14,8 @@ ablation is fitted separately by ``sj-fit-input-whitening``.
 from __future__ import annotations
 
 import argparse
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -27,32 +29,56 @@ NORMALIZATION_FORMAT = "sae-jepa-normalization-v1"
 PCA_FORMAT = "sae-jepa-pca-whitening-v1"
 
 
+_STATS_CHUNK_ROWS = 32768
+
+
+def _chunk_moments(rows: torch.Tensor) -> tuple[int, torch.Tensor, float]:
+    """(count, float64 mean, sum of squared deviations) of one row chunk."""
+    rows = rows.double()
+    mean = rows.mean(dim=0)
+    return len(rows), mean, float((rows - mean).square().sum())
+
+
 @torch.no_grad()
-def compute_train_statistics(source: DataSource, progress: bool = False) -> dict[str, Any]:
+def compute_train_statistics(
+    source: DataSource, progress: bool = False, workers: int = 4
+) -> dict[str, Any]:
     """Mean vector and scalar scale from the train split only.
 
-    Shard statistics are merged with Chan's parallel update in float64 so that
-    large residual means do not cancel catastrophically.
+    Chunk statistics are merged with Chan's parallel update in float64 so that
+    large residual means do not cancel catastrophically.  Shards are read by
+    ``workers`` background threads (disk reads and bf16 gathers release the
+    GIL) while the main thread accumulates, and are converted to float64 one
+    chunk at a time rather than as a whole shard.  The merge order is the shard
+    order, so the result does not depend on ``workers``.
     """
     count = 0
     mean: torch.Tensor | None = None
     m2 = 0.0  # sum over positions of ||h - mean||^2
     paths = source.paths("train")
-    for path in tqdm(paths, desc="train statistics", disable=not progress):
-        rows = source.positions(path).double()
-        n_b = len(rows)
-        if n_b == 0:
-            continue
-        mean_b = rows.mean(dim=0)
-        m2_b = float((rows - mean_b).square().sum())
-        if mean is None:
-            count, mean, m2 = n_b, mean_b, m2_b
-            continue
-        total = count + n_b
-        delta = mean_b - mean
-        mean = mean + delta * (n_b / total)
-        m2 = m2 + m2_b + float(delta.square().sum()) * count * n_b / total
-        count = total
+    with ThreadPoolExecutor(max(1, workers)) as pool:
+        pending: deque[Future] = deque()
+        queue = iter(paths)
+        for _ in range(max(1, workers) + 1):
+            path = next(queue, None)
+            if path is not None:
+                pending.append(pool.submit(source.positions, path))
+        for _ in tqdm(paths, desc="train statistics", disable=not progress):
+            raw = pending.popleft().result()
+            path = next(queue, None)
+            if path is not None:
+                pending.append(pool.submit(source.positions, path))
+            for start in range(0, len(raw), _STATS_CHUNK_ROWS):
+                n_b, mean_b, m2_b = _chunk_moments(raw[start : start + _STATS_CHUNK_ROWS])
+                if mean is None:
+                    count, mean, m2 = n_b, mean_b, m2_b
+                    continue
+                total = count + n_b
+                delta = mean_b - mean
+                mean = mean + delta * (n_b / total)
+                m2 = m2 + m2_b + float(delta.square().sum()) * count * n_b / total
+                count = total
+            del raw
     if mean is None or count < 2:
         raise ValueError("train split holds fewer than two positions")
     d = mean.numel()
