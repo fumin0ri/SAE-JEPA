@@ -22,6 +22,11 @@ import torch
 import torch.nn.functional as F
 
 from .config import ExperimentConfig, config_from_dict, config_to_dict, load_config
+from .covariance import (
+    gaussian_covariance_expected_value,
+    sample_orthonormal_sketch,
+    sketched_covariance_loss,
+)
 from .data import DataSource, TrainBatches, mix_seed, write_json
 from .evaluate import evaluate_model, write_evaluation
 from .models import ARCHITECTURE_ID, DenseSIGRegAE, build_model
@@ -186,6 +191,11 @@ class Trainer:
                 resample_every_step=cfg.sigreg.resample_every_step,
                 seed=mix_seed(cfg.train.seed, cfg.sigreg.seed_offset),
             )
+        self.covariance_generator: torch.Generator | None = None
+        if cfg.covariance.weight > 0:
+            self.covariance_generator = torch.Generator().manual_seed(
+                mix_seed(cfg.train.seed, cfg.covariance.seed_offset)
+            )
         self.step = 0
         self.convention = loss_convention(
             num_projections=cfg.sigreg.num_projections,
@@ -196,6 +206,14 @@ class Trainer:
             resample_every_step=cfg.sigreg.resample_every_step,
             batch_size=cfg.optim.batch_size,
         )
+        if self.covariance_generator is not None:
+            self.convention["covariance"] = {
+                "weight": cfg.covariance.weight,
+                "sketch_dim": cfg.covariance.sketch_dim,
+                "gaussian_expected_value": gaussian_covariance_expected_value(
+                    cfg.optim.batch_size, cfg.covariance.sketch_dim
+                ),
+            }
 
     # ------------------------------------------------------------------ setup
     def _check_required_splits(self) -> None:
@@ -239,6 +257,16 @@ class Trainer:
         reconstruction = F.mse_loss(out["x_hat"].float(), out["x"])
         sigreg = self.sigreg(y) if self.sigreg is not None else None
         loss = reconstruction if sigreg is None else reconstruction + weight * sigreg
+        covariance = None
+        if self.covariance_generator is not None:
+            projection = sample_orthonormal_sketch(
+                self.cfg.model.d_latent,
+                self.cfg.covariance.sketch_dim,
+                self.covariance_generator,
+                self.device,
+            )
+            covariance = sketched_covariance_loss(y, projection)
+            loss = loss + self.cfg.covariance.weight * covariance
         metrics: dict[str, float] = {}
         if diagnostics:
             grad_rec = torch.autograd.grad(reconstruction, y, retain_graph=True)[0]
@@ -262,6 +290,11 @@ class Trainer:
                 if sigreg is not None:
                     metrics["sigreg"] = float(sigreg.detach())
                     metrics["sigreg_weighted"] = float(weight * sigreg.detach())
+                if covariance is not None:
+                    metrics["covariance"] = float(covariance.detach())
+                    metrics["covariance_weighted"] = float(
+                        self.cfg.covariance.weight * covariance.detach()
+                    )
         return loss, metrics
 
     # ---------------------------------------------------------- checkpoints
@@ -278,6 +311,11 @@ class Trainer:
                 "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
                 "sigreg": self.sigreg.state_dict() if self.sigreg is not None else None,
                 "data": self.data.state_dict(),
+                **(
+                    {"covariance": self.covariance_generator.get_state()}
+                    if self.covariance_generator is not None
+                    else {}
+                ),
             },
             "normalization": {
                 "mean": self.normalization["mean"],
@@ -343,6 +381,10 @@ class Trainer:
         if self.sigreg is not None:
             self.sigreg.load_state_dict(state["rng"]["sigreg"])
         self.data.load_state_dict(state["rng"]["data"])
+        if self.covariance_generator is not None:
+            if "covariance" not in state["rng"]:
+                raise ValueError("covariance RNG state missing from checkpoint")
+            self.covariance_generator.set_state(state["rng"]["covariance"])
         self.step = int(state["step"])
 
     # ---------------------------------------------------------------- loop
@@ -410,6 +452,7 @@ class Trainer:
                         print(
                             f"step {self.step}: loss={t['loss']:.4f}"
                             + (f" sigreg={t['sigreg']:.3f}" if "sigreg" in t else "")
+                            + (f" cov={t['covariance']:.4f}" if "covariance" in t else "")
                             + f" lr={t['lr']:.2e}",
                             flush=True,
                         )
@@ -423,6 +466,7 @@ class Trainer:
                     "checkpoint": str(self.output_dir / "checkpoints" / "latest.pt"),
                     "step": self.step,
                     "sigreg_weight": cfg.sigreg.weight,
+                    "covariance_weight": cfg.covariance.weight,
                     "run_name": cfg.name,
                     "seed": cfg.train.seed,
                 }

@@ -122,3 +122,25 @@ def test_end_to_end_checkpoint_frontend_and_report(manifest, tmp_path):
     report = (tmp_path / "report" / "validation.md").read_text(encoding="utf-8")
     assert "Outlier diagnostics" in report
     assert (tmp_path / "report" / "validation_spectra.png").exists()
+
+
+def test_reconstruction_sigreg_covariance_trains_and_resumes(manifest, tmp_path):
+    def make(out):
+        cfg = tiny_config(manifest, out)
+        cfg.covariance.weight = 0.5
+        cfg.covariance.sketch_dim = 4
+        return Trainer(cfg)
+
+    trainer = make(tmp_path / "a")
+    _, metrics = trainer.loss(next(trainer.data), diagnostics=True)
+    assert metrics["covariance"] > 0 and metrics["sigreg"] > 0
+    assert metrics["covariance_weighted"] == pytest.approx(0.5 * metrics["covariance"])
+    full = make(tmp_path / "b")
+    full.run()
+    part = make(tmp_path / "c")
+    part.run(max_steps=4)
+    resumed = make(tmp_path / "c")
+    resumed.load_checkpoint(tmp_path / "c" / "checkpoints" / "latest.pt")
+    resumed.run()
+    for k, v in full.model.state_dict().items():
+        assert torch.equal(v, resumed.model.state_dict()[k])

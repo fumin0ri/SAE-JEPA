@@ -153,8 +153,10 @@ class ExperimentConfig:
         if type(cc.sketch_dim) is not int or cc.sketch_dim < 1:
             raise ValueError("covariance.sketch_dim must be a positive integer")
         if cc.weight > 0:
-            if self.model.type != "masked_sigreg_encoder":
-                raise ValueError("covariance requires model.type=masked_sigreg_encoder")
+            if self.model.type not in {"dense_sigreg_ae", "masked_sigreg_encoder"}:
+                raise ValueError("covariance requires dense_sigreg_ae or masked_sigreg_encoder")
+            if self.model.type == "dense_sigreg_ae" and not self.sigreg.weight > 0:
+                raise ValueError("dense covariance (reconstruction + SIGReg + cov) requires sigreg.weight > 0")
             if cc.sketch_dim > self.model.d_latent or cc.sketch_dim >= self.optim.batch_size:
                 raise ValueError("covariance.sketch_dim must be <= d_latent and < training batch size")
             if cc.sketch_dim >= self.eval.batch_size:
