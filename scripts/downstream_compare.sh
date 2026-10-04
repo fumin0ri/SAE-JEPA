@@ -9,7 +9,7 @@ cd "$ROOT_DIR"
 : "${ACTIVATION_MANIFEST:?Set ACTIVATION_MANIFEST}"
 RUN_ROOT="${RUN_ROOT:-runs/downstream}"
 PROBE_TASKS="${PROBE_TASKS:-data/probe/ag-news.jsonl}"
-ACTIVATION_CACHE="${ACTIVATION_CACHE:-data/probe/ag-news-activations}"
+ACTIVATION_CACHE="${ACTIVATION_CACHE:-$RUN_ROOT/probe-cache}"  # per-run: a cache from other settings is refused
 DEVICE="${DEVICE:-cuda}"
 checkpoints=()
 mkdir -p "$RUN_ROOT"
