@@ -46,22 +46,61 @@ def test_gaussian_floor_and_anisotropy():
     assert sketched_covariance_loss(anisotropic, torch.eye(4)) > 100 * sketched_covariance_loss(y, torch.eye(4))
 
 
+def test_split_half_matches_formula_and_is_translation_invariant():
+    rng = torch.Generator().manual_seed(6)
+    y = torch.randn(33, 12, generator=rng, requires_grad=True)
+    r = sample_orthonormal_sketch(12, 4, rng)
+    z = y.double() @ r.double()
+    eye = torch.eye(4, dtype=torch.float64)
+    expected = ((torch.cov(z[:16].T) - eye) * (torch.cov(z[16:].T) - eye)).mean()
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        actual = sketched_covariance_loss(y, r, "split_half")
+    assert actual.dtype == torch.float32
+    torch.testing.assert_close(actual.double(), expected, rtol=1e-5, atol=1e-7)
+    torch.testing.assert_close(actual, sketched_covariance_loss(y + 3, r, "split_half"))
+    actual.backward()
+    assert torch.isfinite(y.grad).all() and y.grad.norm() > 0
+    with pytest.raises(ValueError, match="estimator"):
+        sketched_covariance_loss(y, r, "bogus")
+
+
+@pytest.mark.parametrize("scale", [1.0, 0.8])
+def test_split_half_is_unbiased_while_plugin_prefers_shrinkage(scale):
+    # Population covariance scale * I_k: the exact loss is (scale - 1)^2 / k.
+    b, k = 32, 8
+    rng = torch.Generator().manual_seed(45)
+    samples = scale ** .5 * torch.randn(4000, b, k, generator=rng)
+    split = torch.stack([sketched_covariance_loss(s, torch.eye(k), "split_half") for s in samples])
+    plugin = torch.stack([sketched_covariance_loss(s, torch.eye(k)) for s in samples])
+    exact = (scale - 1) ** 2 / k
+    assert float(split.mean()) == pytest.approx(exact, abs=4 * float(split.std()) / len(split) ** .5)
+    if scale == 1.0:
+        assert gaussian_covariance_expected_value(b, k, "split_half") == 0.0
+        # Shrinking toward (B-1)/(B+k) lowers the plug-in loss below its value at I.
+        shrunk = ((b - 1) / (b + k)) ** .5 * samples
+        assert float(torch.stack([sketched_covariance_loss(s, torch.eye(k)) for s in shrunk]).mean()) < float(plugin.mean())
+    else:
+        assert float(plugin.mean()) < gaussian_covariance_expected_value(b, k)
+
+
 @pytest.mark.parametrize("override", ["covariance.weight=-1", "covariance.weight=.nan",
     "covariance.weight=.inf", "covariance.sketch_dim=0", "covariance.sketch_dim=1.5",
-    "covariance.sketch_dim=512", "covariance.sketch_dim=4097"])
+    "covariance.sketch_dim=512", "covariance.sketch_dim=4097", "covariance.estimator=bogus"])
 def test_invalid_settings(override):
     with pytest.raises(ValueError, match="covariance"):
         load_config(overrides=["model.type=masked_sigreg_encoder", "sigreg.weight=.1",
                                "covariance.weight=1", override])
 
 
-@pytest.mark.parametrize("masked", [True, False])
-def test_objective_gradients_evaluation_and_exact_resume(manifest, tmp_path, masked):
+@pytest.mark.parametrize("masked,estimator", [(True, "plugin"), (False, "plugin"),
+                                              (True, "split_half")])
+def test_objective_gradients_evaluation_and_exact_resume(manifest, tmp_path, masked, estimator):
     def make(path):
         cfg = config(manifest, path)
         cfg.masking.enabled = masked
         cfg.covariance.weight = 2.0
         cfg.covariance.sketch_dim = 4
+        cfg.covariance.estimator = estimator
         return MaskedTrainer(cfg)
 
     trainer = make(tmp_path / "straight")
@@ -75,6 +114,8 @@ def test_objective_gradients_evaluation_and_exact_resume(manifest, tmp_path, mas
     first, second = trainer.validate(), trainer.validate()
     assert first == second
     assert "reference/sketched_covariance" in first
+    assert first["covariance_estimator"] == estimator
+    assert trainer.convention["covariance"]["estimator"] == estimator
     assert torch.equal(state, trainer.covariance_generator.get_state())
 
     # Start both runs afresh, then compare uninterrupted and resumed training.
@@ -91,6 +132,10 @@ def test_objective_gradients_evaluation_and_exact_resume(manifest, tmp_path, mas
     assert torch.equal(trainer.covariance_generator.get_state(), resumed.covariance_generator.get_state())
     resumed.cfg.covariance.weight = 3
     with pytest.raises(ValueError, match="covariance.weight"):
+        MaskedTrainer(resumed.cfg).load_checkpoint(checkpoint)
+    resumed.cfg.covariance.weight = 2.0
+    resumed.cfg.covariance.estimator = "plugin" if estimator == "split_half" else "split_half"
+    with pytest.raises(ValueError, match="covariance.estimator"):
         MaskedTrainer(resumed.cfg).load_checkpoint(checkpoint)
 
 

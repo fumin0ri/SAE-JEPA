@@ -25,6 +25,7 @@ sigreg:
 covariance:
   weight: 0.1                    # beta; 0 disables
   sketch_dim: 64                 # must be < batch size
+  estimator: plugin              # plugin (shrinks variance to (B-1)/(B+k)) | split_half (unbiased)
 optim:
   batch_size: 512
   lr: 1.0e-4

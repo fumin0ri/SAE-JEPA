@@ -210,8 +210,9 @@ class Trainer:
             self.convention["covariance"] = {
                 "weight": cfg.covariance.weight,
                 "sketch_dim": cfg.covariance.sketch_dim,
+                "estimator": cfg.covariance.estimator,
                 "gaussian_expected_value": gaussian_covariance_expected_value(
-                    cfg.optim.batch_size, cfg.covariance.sketch_dim
+                    cfg.optim.batch_size, cfg.covariance.sketch_dim, cfg.covariance.estimator
                 ),
             }
 
@@ -265,7 +266,7 @@ class Trainer:
                 self.covariance_generator,
                 self.device,
             )
-            covariance = sketched_covariance_loss(y, projection)
+            covariance = sketched_covariance_loss(y, projection, self.cfg.covariance.estimator)
             loss = loss + self.cfg.covariance.weight * covariance
         metrics: dict[str, float] = {}
         if diagnostics:

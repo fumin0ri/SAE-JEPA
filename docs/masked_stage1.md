@@ -147,6 +147,23 @@ mask無効時はmasked項を出しません。betaは重み付きSIGReg・consis
 これを `covariance_gaussian_expected_value` として併記します。
 ノイズフロアの減算やバイアス補正は行いません。ガウス母共分散 `a I_k` に対して
 この損失単独が好む分散は `a=(B-1)/(B+k)` なので、平均分散の縮小にも注意します。
+（k=256, B=512 では a≈0.665 で、βが支配的なrunの平均分散はこの値に近づきます。）
+
+### split-half推定量（`covariance.estimator=split_half`）
+
+上の縮小を避けるには `--set covariance.estimator=split_half` を指定します。
+
+```text
+C_1 = Cov(z[:B//2]);  C_2 = Cov(z[B//2:])   # 半分ずつ中心化、分母 n-1
+cov_view = mean((C_1 - I_k) * (C_2 - I_k))
+```
+
+2つの半分が独立なら期待値は母集団の `||Cov - I_k||_F^2 / k^2` に一致し、
+最小点は Cov = I（縮小なし）、N(0,I) での期待値は0です（負の値も取り得ます）。
+勾配も母集団損失の不偏推定です。学習batchはshard window内でシャッフル済みなので
+前半／後半を使います。分散はplug-inより大きくなります。
+既定は従来の `plugin` で、旧checkpointはそのまま再開できます。推定量を変えた再開は拒否します。
+評価JSONには `covariance_estimator` を記録し、`sketched_covariance` も同じ推定量で計算します。
 検証にはheld-out SIGReg・全共分散のPR／有効ランク／最大固有値・ノルム尾部も使ってください。
 
 ## 指標と読み方

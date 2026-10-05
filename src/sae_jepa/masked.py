@@ -173,12 +173,16 @@ class MaskedTrainer(Trainer):
         if self.covariance_generator is not None:
             self.convention["objective"] += " + beta * mean_view(CovLoss(y_view))"
             self.convention["covariance"] = {
-                "formula": "mean((Cov(y @ R) - I_k)^2); centered; denominator B-1",
+                "formula": ("mean((Cov(y @ R) - I_k)^2); centered; denominator B-1"
+                            if cfg.covariance.estimator == "plugin" else
+                            "mean((Cov(y[:B//2] @ R) - I_k) * (Cov(y[B//2:] @ R) - I_k)); "
+                            "each half centered; denominator n-1"),
+                "estimator": cfg.covariance.estimator,
                 "weight": cfg.covariance.weight, "sketch_dim": cfg.covariance.sketch_dim,
                 "projection": "orthonormal columns; fresh each step; shared between views",
                 "precision": "float32; autocast disabled",
                 "gaussian_expected_value": gaussian_covariance_expected_value(
-                    cfg.optim.batch_size, cfg.covariance.sketch_dim),
+                    cfg.optim.batch_size, cfg.covariance.sketch_dim, cfg.covariance.estimator),
             }
 
     def covariance_term(self, views, diagnostics):
@@ -186,7 +190,8 @@ class MaskedTrainer(Trainer):
         projection = sample_orthonormal_sketch(
             self.cfg.model.d_latent, self.cfg.covariance.sketch_dim,
             self.covariance_generator, self.device)
-        terms = [sketched_covariance_loss(v, projection) for v in views]
+        terms = [sketched_covariance_loss(v, projection, self.cfg.covariance.estimator)
+                 for v in views]
         covariance = sum(terms) / len(terms)
         weighted = self.cfg.covariance.weight * covariance
         metrics = {}
@@ -365,7 +370,8 @@ def _evaluate(model, source, cfg, device, split, detailed, batches, norm_diagnos
                 raise ValueError("nonfinite evaluation representation")
             moments[name].add(v)
             if cov_projection is not None:
-                cov_totals[name] += float(sketched_covariance_loss(v, cov_projection))
+                cov_totals[name] += float(sketched_covariance_loss(
+                    v, cov_projection, cfg.covariance.estimator))
             for test in tests[name].values():
                 test.add(v)
             if detailed:
@@ -390,9 +396,10 @@ def _evaluate(model, source, cfg, device, split, detailed, batches, norm_diagnos
     if cov_projection is not None:
         result.update({"covariance_weight": cfg.covariance.weight,
                        "covariance_sketch_dim": cfg.covariance.sketch_dim,
+                       "covariance_estimator": cfg.covariance.estimator,
                        "covariance_validation_seed": cfg.covariance.validation_seed,
                        "covariance_gaussian_expected_value": gaussian_covariance_expected_value(
-                           ec.batch_size, cfg.covariance.sketch_dim)})
+                           ec.batch_size, cfg.covariance.sketch_dim, cfg.covariance.estimator)})
         for name in names:
             result[f"{name}/sketched_covariance"] = cov_totals[name] / count
     result['input_transform'] = 'zca' if hasattr(model, 'whitening_matrix') else 'scalar'
