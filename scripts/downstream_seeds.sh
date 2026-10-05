@@ -21,7 +21,9 @@ for run in $STAGE1_RUNS; do
   [[ -f "$run/checkpoints/latest.pt" ]] || { echo "missing $run/checkpoints/latest.pt" >&2; exit 1; }
 done
 if [[ ! -f "$PROBE_TASKS" ]]; then
-  prepare_args=(--train-size 4000 --test-size 1000 --seed 42 --output "$PROBE_TASKS")
+  # Dedup by truncated tokens too, so collect's cross-split leakage check passes.
+  prepare_args=(--train-size 4000 --test-size 1000 --seed 42 --output "$PROBE_TASKS"
+    --tokenizer "${PROBE_TOKENIZER:-EleutherAI/pythia-6.9b}" --context-length "${CONTEXT_LENGTH:-128}")
   if [[ -n "$PROBE_DATASETS" ]]; then prepare_args+=(--datasets $PROBE_DATASETS); fi
   sj-probe prepare "${prepare_args[@]}"
 fi

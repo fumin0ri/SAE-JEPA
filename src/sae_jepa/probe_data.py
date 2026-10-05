@@ -68,30 +68,47 @@ def read_tasks(path):
     return rows
 
 
-def binary_rows(dataset, train, test, classes, seed, validation_fraction):
+def truncated_token_key(tokenizer, context_length):
+    """Dedup key matching collect(): texts whose truncated token ids agree are duplicates."""
+    def key(text):
+        ids = tokenizer(text, add_special_tokens=False, truncation=True, max_length=context_length)['input_ids']
+        return hashlib.sha256(json.dumps(ids).encode()).hexdigest()
+    return key
+
+
+def binary_rows(dataset, train, test, classes, seed, validation_fraction, dedup_key=text_id):
     """Deduplicate before splitting; reserve validation from the source train set."""
     rng = random.Random(seed)
     pools = {s: {} for s in SPLITS}
     seen = set()
+
+    def add(text, unique, claimed):
+        # Always dedup by normalized text; an extra key (e.g. truncated tokens) also
+        # drops later texts that collide with an earlier, different text.
+        key = text_id(text)
+        if key in seen:
+            return
+        if dedup_key is not text_id:
+            extra = "extra:" + dedup_key(text)
+            if extra in seen or claimed.setdefault(extra, key) != key:
+                return
+        unique[key] = text
+
     for cls in classes:
-        unique = {}
+        unique, claimed = {}, {}
         for text in train[cls]:
-            key = text_id(text)
-            if key not in seen:
-                unique[key] = text
-        seen.update(unique)
+            add(text, unique, claimed)
+        seen.update(unique); seen.update(claimed)
         values = list(unique.values()); rng.shuffle(values)
         n_val = max(1, int(len(values) * validation_fraction))
         if len(values) - n_val < 1:
             raise ValueError(f"too few distinct training examples for {dataset}/{cls}")
         pools["validation"][cls], pools["train"][cls] = values[:n_val], values[n_val:]
     for cls in classes:
-        values = {}
+        values, claimed = {}, {}
         for text in test[cls]:
-            key = text_id(text)
-            if key not in seen:
-                values[key] = text
-        seen.update(values)
+            add(text, values, claimed)
+        seen.update(values); seen.update(claimed)
         pools["test"][cls] = list(values.values())
     rows = []
     for cls in classes:
@@ -125,11 +142,19 @@ def prepare(args):
     output = Path(args.output)
     if output.exists():
         raise ValueError("task file already exists; choose a new output")
+    dedup_key = text_id
+    if args.tokenizer:
+        # Also drop texts that only differ after the collector's truncation, which
+        # collect() would otherwise refuse as cross-split leakage.
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, revision=args.tokenizer_revision)
+        dedup_key = truncated_token_key(tokenizer, args.context_length)
     rows = []
     for dataset in args.datasets:
         print(f"Preparing {dataset}", flush=True)
         train, test = get_multi_label_train_test_data(dataset, args.train_size, args.test_size, args.seed)
-        rows.extend(binary_rows(dataset, train, test, chosen_classes_per_dataset[dataset], args.seed, args.validation_fraction))
+        rows.extend(binary_rows(dataset, train, test, chosen_classes_per_dataset[dataset], args.seed,
+                                args.validation_fraction, dedup_key))
     output.parent.mkdir(parents=True, exist_ok=True)
     partial = output.with_suffix(output.suffix + ".partial")
     partial.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows), encoding="utf-8")

@@ -63,6 +63,22 @@ def test_split_leakage_and_data_preparation(tmp_path):
     assert read_tasks(path)[0]['text'] == rows[0]['text']
 
 
+def test_truncated_token_dedup_prevents_cross_split_leakage():
+    # Toy tokenizer/truncation: texts sharing their first 3 words are one sequence.
+    prefix = lambda text: ' '.join(text.split()[:3])
+    encode = lambda text: [hash(w) for w in text.split()[:3]]
+    train = {c: [f'{c} header same {c}{i} train' for i in range(20)] + [f'{c} unique {i} train' for i in range(20)]
+             for c in ['a', 'b']}
+    test = {c: [f'{c} header same {c}{i} test' for i in range(10)] + [f'{c} other {i} test' for i in range(10)]
+            for c in ['a', 'b']}
+    rows = binary_rows('data', train, test, ['a', 'b'], 42, .2)
+    with pytest.raises(ValueError, match='truncated'):
+        check_token_leakage(rows, {text_id(r['text']): encode(r['text']) for r in rows})
+    rows = binary_rows('data', train, test, ['a', 'b'], 42, .2, dedup_key=prefix)
+    check_token_leakage(rows, {text_id(r['text']): encode(r['text']) for r in rows})
+    assert sum(r['text'].split()[1] == 'header' for r in rows if r['task'] == 'data/a') <= 2
+
+
 def test_macro_aggregation_distinguishes_datasets():
     tasks = {str(i): {'dataset': 'a' if i < 3 else 'b', 'scores': {'1': {'test': {'accuracy': 1. if i < 3 else 0.}}}} for i in range(4)}
     r = aggregate(tasks, 'test', 1)
