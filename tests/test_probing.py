@@ -58,6 +58,9 @@ def test_split_leakage_and_data_preparation(tmp_path):
     out = binary_rows('data',train,test,['a','b'],42,.2)
     assert out == binary_rows('data',train,test,['a','b'],42,.2)
     rows = out; save(); read_tasks(path)
+    rows = examples(); rows[0]['text'] = 'line sep\x85next\x1cfile'
+    path.write_text(''.join(json.dumps(r, ensure_ascii=False)+'\n' for r in rows), encoding='utf-8')
+    assert read_tasks(path)[0]['text'] == rows[0]['text']
 
 
 def test_macro_aggregation_distinguishes_datasets():

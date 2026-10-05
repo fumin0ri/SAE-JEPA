@@ -34,7 +34,10 @@ def file_hash(path):
 
 
 def read_tasks(path):
-    rows = [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines() if line.strip()]
+    # Split on "\n" only: str.splitlines() also breaks on U+2028, U+0085 etc., which
+    # json.dumps(ensure_ascii=False) leaves unescaped inside text (e.g. europarl).
+    lines = Path(path).read_text(encoding="utf-8").split("\n")
+    rows = [json.loads(line) for line in lines if line.strip()]
     if not rows:
         raise ValueError("empty probe task file")
     seen, groups, contents = set(), {}, {}
