@@ -124,7 +124,7 @@ def test_end_to_end_checkpoint_frontend_and_report(manifest, tmp_path):
     assert (tmp_path / "report" / "validation_spectra.png").exists()
 
 
-@pytest.mark.parametrize("estimator", ["plugin", "split_half"])
+@pytest.mark.parametrize("estimator", ["plugin", "split_half", "split_half_corr"])
 def test_reconstruction_sigreg_covariance_trains_and_resumes(manifest, tmp_path, estimator):
     def make(out):
         cfg = tiny_config(manifest, out)
@@ -137,7 +137,7 @@ def test_reconstruction_sigreg_covariance_trains_and_resumes(manifest, tmp_path,
     assert trainer.convention["covariance"]["estimator"] == estimator
     _, metrics = trainer.loss(next(trainer.data), diagnostics=True)
     assert metrics["sigreg"] > 0
-    assert metrics["covariance"] != 0 if estimator == "split_half" else metrics["covariance"] > 0
+    assert metrics["covariance"] > 0 if estimator == "plugin" else metrics["covariance"] != 0
     assert metrics["covariance_weighted"] == pytest.approx(0.5 * metrics["covariance"])
     full = make(tmp_path / "b")
     full.run()

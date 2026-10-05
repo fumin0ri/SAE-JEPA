@@ -61,8 +61,9 @@ class SIGRegConfig:
 class CovarianceConfig:
     weight: float = 0.0  # beta; zero preserves the original objective and RNGs
     sketch_dim: int = 64
-    # "plugin" (original; biased toward shrunken variance) or "split_half"
-    # (unbiased estimate of ||Cov - I||^2 from two independent batch halves)
+    # "plugin" (original; biased toward shrunken variance), "split_half"
+    # (unbiased estimate of ||Cov - I||^2 from two independent batch halves) or
+    # "split_half_corr" (off-diagonal correlations only; scale left to SIGReg)
     estimator: str = "plugin"
     seed_offset: int = 4_000_037
     validation_seed: int = 91_003
@@ -155,8 +156,8 @@ class ExperimentConfig:
             raise ValueError("covariance.weight must be finite and non-negative")
         if type(cc.sketch_dim) is not int or cc.sketch_dim < 1:
             raise ValueError("covariance.sketch_dim must be a positive integer")
-        if cc.estimator not in ("plugin", "split_half"):
-            raise ValueError("covariance.estimator must be 'plugin' or 'split_half'")
+        if cc.estimator not in ("plugin", "split_half", "split_half_corr"):
+            raise ValueError("covariance.estimator must be 'plugin', 'split_half' or 'split_half_corr'")
         if cc.weight > 0:
             if self.model.type not in {"dense_sigreg_ae", "masked_sigreg_encoder"}:
                 raise ValueError("covariance requires dense_sigreg_ae or masked_sigreg_encoder")
@@ -166,8 +167,8 @@ class ExperimentConfig:
                 raise ValueError("covariance.sketch_dim must be <= d_latent and < training batch size")
             if cc.sketch_dim >= self.eval.batch_size:
                 raise ValueError("covariance.sketch_dim must be < evaluation batch size")
-            if cc.estimator == "split_half" and min(self.optim.batch_size, self.eval.batch_size) < 4:
-                raise ValueError("covariance.estimator=split_half requires batch sizes >= 4")
+            if cc.estimator != "plugin" and min(self.optim.batch_size, self.eval.batch_size) < 4:
+                raise ValueError(f"covariance.estimator={cc.estimator} requires batch sizes >= 4")
         if self.data.input_whitening_path and (self.model.type != "masked_sigreg_encoder" or self.masking.enabled):
             raise ValueError("input whitening currently requires SIGReg-only (masked encoder, masking.enabled=false)")
         if not isinstance(self.masking.enabled, bool):

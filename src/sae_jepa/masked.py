@@ -176,7 +176,10 @@ class MaskedTrainer(Trainer):
                 "formula": ("mean((Cov(y @ R) - I_k)^2); centered; denominator B-1"
                             if cfg.covariance.estimator == "plugin" else
                             "mean((Cov(y[:B//2] @ R) - I_k) * (Cov(y[B//2:] @ R) - I_k)); "
-                            "each half centered; denominator n-1"),
+                            "each half centered; denominator n-1"
+                            if cfg.covariance.estimator == "split_half" else
+                            "sum_{i!=j} Corr(y[:B//2] @ R)_ij * Corr(y[B//2:] @ R)_ij / k^2; "
+                            "each half centered"),
                 "estimator": cfg.covariance.estimator,
                 "weight": cfg.covariance.weight, "sketch_dim": cfg.covariance.sketch_dim,
                 "projection": "orthonormal columns; fresh each step; shared between views",

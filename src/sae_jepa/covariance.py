@@ -1,7 +1,7 @@
 """Random orthonormal sketches of the centered, unbiased sample covariance.
 
-Two estimators of ||Cov(y R) - I_k||_F^2 / k^2, neither with a batch-size
-factor. Both constrain second moments, not the output mean.
+Estimators of second-moment losses on z = y R, none with a batch-size factor.
+They constrain second moments, not the output mean.
 
 * ``plugin``: the squared error of the full-batch sample covariance. Its
   expectation carries a finite-batch noise floor, and for a population
@@ -10,7 +10,14 @@ factor. Both constrain second moments, not the output mean.
   covariances of the two batch halves, each centered on its own mean. For
   independent halves its expectation is exactly the population loss, so it is
   minimized at Cov = I and is zero in expectation for N(0, I). It can be
-  negative.
+  negative. When correlations remain, ||s^2 R - I||^2 is still minimized at
+  s^2 = k / ||R||_F^2 < 1, so this loss also pulls the scale down.
+* ``split_half_corr``: ``sum_{i != j} r1_ij * r2_ij / k^2`` with r1, r2 the
+  sample correlation matrices of the two halves. It estimates the squared
+  off-diagonal population correlations, leaves every per-direction scale to
+  SIGReg, and so exerts no pull on variance. It is zero in expectation for
+  any distribution with independent coordinates and can be negative; nonzero
+  correlations are underestimated by O(1/n) per half.
 """
 from __future__ import annotations
 
@@ -29,7 +36,8 @@ def sample_orthonormal_sketch(d: int, k: int, generator: torch.Generator,
         return q * torch.where(r.diagonal() < 0, -1.0, 1.0)
 
 
-ESTIMATORS = ("plugin", "split_half")
+ESTIMATORS = ("plugin", "split_half", "split_half_corr")
+CORRELATION_EPS = 1e-8  # added to the variance before the square root
 
 
 def _centered_covariance(z: torch.Tensor) -> torch.Tensor:
@@ -37,11 +45,18 @@ def _centered_covariance(z: torch.Tensor) -> torch.Tensor:
     return z.T @ z / (len(z) - 1)
 
 
+def _off_diagonal_correlation(z: torch.Tensor) -> torch.Tensor:
+    covariance = _centered_covariance(z)
+    inverse_std = (covariance.diagonal() + CORRELATION_EPS).rsqrt()
+    correlation = covariance * inverse_std[:, None] * inverse_std[None, :]
+    return correlation - torch.diag(correlation.diagonal())
+
+
 def sketched_covariance_loss(y: torch.Tensor, projection: torch.Tensor,
                              estimator: str = "plugin") -> torch.Tensor:
     """Float32 covariance loss; caller supplies an orthonormal [d, k] sketch.
 
-    ``split_half`` splits the batch into its first B//2 rows and the rest.
+    The split-half estimators use the first B//2 rows and the rest.
     """
     if estimator not in ESTIMATORS:
         raise ValueError(f"unknown covariance estimator {estimator!r}")
@@ -57,8 +72,12 @@ def sketched_covariance_loss(y: torch.Tensor, projection: torch.Tensor,
         if estimator == "plugin":
             return (_centered_covariance(z) - identity).square().mean()
         half = b // 2
-        first = _centered_covariance(z[:half]) - identity
-        second = _centered_covariance(z[half:]) - identity
+        if estimator == "split_half_corr":
+            first = _off_diagonal_correlation(z[:half])
+            second = _off_diagonal_correlation(z[half:])
+        else:
+            first = _centered_covariance(z[:half]) - identity
+            second = _centered_covariance(z[half:]) - identity
         return (first * second).mean()
 
 
@@ -69,6 +88,6 @@ def gaussian_covariance_expected_value(batch_size: int, k: int,
         raise ValueError(f"unknown covariance estimator {estimator!r}")
     if not 1 <= k < batch_size:
         raise ValueError("require 1 <= sketch_dim < batch size")
-    if estimator == "split_half":
+    if estimator != "plugin":
         return 0.0
     return (k + 1) / (k * (batch_size - 1))

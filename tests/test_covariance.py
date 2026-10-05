@@ -83,6 +83,46 @@ def test_split_half_is_unbiased_while_plugin_prefers_shrinkage(scale):
         assert float(plugin.mean()) < gaussian_covariance_expected_value(b, k)
 
 
+def test_split_half_corr_matches_formula_and_ignores_scale():
+    rng = torch.Generator().manual_seed(7)
+    y = torch.randn(33, 12, generator=rng) @ torch.randn(12, 12, generator=rng)
+    y.requires_grad_(True)
+    r = sample_orthonormal_sketch(12, 4, rng)
+    z = y.detach().double() @ r.double()
+    off = 1 - torch.eye(4, dtype=torch.float64)
+    expected = (torch.corrcoef(z[:16].T) * torch.corrcoef(z[16:].T) * off).sum() / 16
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        actual = sketched_covariance_loss(y, r, "split_half_corr")
+    assert actual.dtype == torch.float32
+    torch.testing.assert_close(actual.double(), expected, rtol=1e-4, atol=1e-6)
+    # Invariant to per-direction scale in the sketch, hence no pull on variance.
+    scales = torch.tensor([.1, 1., 3., 10.])
+    torch.testing.assert_close(
+        sketched_covariance_loss(y.detach() @ r * scales, torch.eye(4), "split_half_corr"),
+        sketched_covariance_loss(y.detach() @ r, torch.eye(4), "split_half_corr"), rtol=1e-4, atol=1e-6)
+    actual.backward()
+    assert torch.isfinite(y.grad).all() and y.grad.norm() > 0
+    assert float((y.grad * y.detach()).sum()) == pytest.approx(0, abs=1e-4 * float(y.grad.norm() * y.detach().norm()))
+
+
+@pytest.mark.parametrize("rho", [0.0, 0.5])
+def test_split_half_corr_estimates_squared_correlation(rho):
+    # Non-Gaussian marginals: zero mean for independent coordinates; for rho != 0
+    # sample correlations shrink toward 0 by O(1/n) (about 3% here at n=32).
+    b, k = 64, 2
+    rng = torch.Generator().manual_seed(46)
+    u = torch.rand(4000, b, k, generator=rng) - .5
+    samples = torch.stack([u[..., 0], rho * u[..., 0] + (1 - rho ** 2) ** .5 * u[..., 1]], -1) * 5
+    losses = torch.stack([sketched_covariance_loss(s, torch.eye(k), "split_half_corr") for s in samples])
+    exact = 2 * rho ** 2 / k ** 2
+    tolerance = 4 * float(losses.std()) / len(losses) ** .5
+    if rho == 0:
+        assert float(losses.mean()) == pytest.approx(0, abs=tolerance)
+    else:
+        assert .94 * exact < float(losses.mean()) < exact + tolerance
+    assert gaussian_covariance_expected_value(b, k, "split_half_corr") == 0.0
+
+
 @pytest.mark.parametrize("override", ["covariance.weight=-1", "covariance.weight=.nan",
     "covariance.weight=.inf", "covariance.sketch_dim=0", "covariance.sketch_dim=1.5",
     "covariance.sketch_dim=512", "covariance.sketch_dim=4097", "covariance.estimator=bogus"])
@@ -93,7 +133,7 @@ def test_invalid_settings(override):
 
 
 @pytest.mark.parametrize("masked,estimator", [(True, "plugin"), (False, "plugin"),
-                                              (True, "split_half")])
+                                              (True, "split_half"), (False, "split_half_corr")])
 def test_objective_gradients_evaluation_and_exact_resume(manifest, tmp_path, masked, estimator):
     def make(path):
         cfg = config(manifest, path)
@@ -134,7 +174,7 @@ def test_objective_gradients_evaluation_and_exact_resume(manifest, tmp_path, mas
     with pytest.raises(ValueError, match="covariance.weight"):
         MaskedTrainer(resumed.cfg).load_checkpoint(checkpoint)
     resumed.cfg.covariance.weight = 2.0
-    resumed.cfg.covariance.estimator = "plugin" if estimator == "split_half" else "split_half"
+    resumed.cfg.covariance.estimator = "split_half" if estimator == "plugin" else "plugin"
     with pytest.raises(ValueError, match="covariance.estimator"):
         MaskedTrainer(resumed.cfg).load_checkpoint(checkpoint)
 
