@@ -211,6 +211,7 @@ class Trainer:
                 "weight": cfg.covariance.weight,
                 "sketch_dim": cfg.covariance.sketch_dim,
                 "estimator": cfg.covariance.estimator,
+                "warmup_steps": cfg.covariance.warmup_steps,
                 "gaussian_expected_value": gaussian_covariance_expected_value(
                     cfg.optim.batch_size, cfg.covariance.sketch_dim, cfg.covariance.estimator
                 ),
@@ -248,6 +249,13 @@ class Trainer:
         return stats
 
     # ------------------------------------------------------------ objective
+    def covariance_weight(self) -> float:
+        """Beta for the current step, ramped linearly over covariance.warmup_steps."""
+        cc = self.cfg.covariance
+        if cc.warmup_steps == 0:
+            return cc.weight
+        return cc.weight * min(1.0, self.step / cc.warmup_steps)
+
     def loss(
         self, h: torch.Tensor, diagnostics: bool
     ) -> tuple[torch.Tensor, dict[str, float]]:
@@ -267,7 +275,8 @@ class Trainer:
                 self.device,
             )
             covariance = sketched_covariance_loss(y, projection, self.cfg.covariance.estimator)
-            loss = loss + self.cfg.covariance.weight * covariance
+            covariance_weight = self.covariance_weight()
+            loss = loss + covariance_weight * covariance
         metrics: dict[str, float] = {}
         if diagnostics:
             grad_rec = torch.autograd.grad(reconstruction, y, retain_graph=True)[0]
@@ -294,8 +303,9 @@ class Trainer:
                 if covariance is not None:
                     metrics["covariance"] = float(covariance.detach())
                     metrics["covariance_weighted"] = float(
-                        self.cfg.covariance.weight * covariance.detach()
+                        covariance_weight * covariance.detach()
                     )
+                    metrics["covariance_weight_effective"] = covariance_weight
         return loss, metrics
 
     # ---------------------------------------------------------- checkpoints

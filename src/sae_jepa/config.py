@@ -65,6 +65,9 @@ class CovarianceConfig:
     # (unbiased estimate of ||Cov - I||^2 from two independent batch halves) or
     # "split_half_corr" (off-diagonal correlations only; scale left to SIGReg)
     estimator: str = "plugin"
+    # Ramp beta linearly from 0 at step 0 to full weight at this step (0 = off),
+    # so SIGReg can grow the output scale before decorrelation acts.
+    warmup_steps: int = 0
     seed_offset: int = 4_000_037
     validation_seed: int = 91_003
 
@@ -156,6 +159,8 @@ class ExperimentConfig:
             raise ValueError("covariance.weight must be finite and non-negative")
         if type(cc.sketch_dim) is not int or cc.sketch_dim < 1:
             raise ValueError("covariance.sketch_dim must be a positive integer")
+        if type(cc.warmup_steps) is not int or cc.warmup_steps < 0:
+            raise ValueError("covariance.warmup_steps must be a non-negative integer")
         if cc.estimator not in ("plugin", "split_half", "split_half_corr"):
             raise ValueError("covariance.estimator must be 'plugin', 'split_half' or 'split_half_corr'")
         if cc.weight > 0:

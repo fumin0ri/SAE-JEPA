@@ -181,6 +181,7 @@ class MaskedTrainer(Trainer):
                             "sum_{i!=j} Corr(y[:B//2] @ R)_ij * Corr(y[B//2:] @ R)_ij / k^2; "
                             "each half centered"),
                 "estimator": cfg.covariance.estimator,
+                "warmup_steps": cfg.covariance.warmup_steps,
                 "weight": cfg.covariance.weight, "sketch_dim": cfg.covariance.sketch_dim,
                 "projection": "orthonormal columns; fresh each step; shared between views",
                 "precision": "float32; autocast disabled",
@@ -196,11 +197,13 @@ class MaskedTrainer(Trainer):
         terms = [sketched_covariance_loss(v, projection, self.cfg.covariance.estimator)
                  for v in views]
         covariance = sum(terms) / len(terms)
-        weighted = self.cfg.covariance.weight * covariance
+        weight = self.covariance_weight()
+        weighted = weight * covariance
         metrics = {}
         if diagnostics:
             metrics = {"covariance": float(covariance.detach()),
-                       "covariance_weighted": float(weighted.detach())}
+                       "covariance_weighted": float(weighted.detach()),
+                       "covariance_weight_effective": weight}
             gradients = torch.autograd.grad(weighted, views, retain_graph=True)
             for name, term, gradient in zip(("full", "masked"), terms, gradients):
                 metrics[f"covariance_{name}"] = float(term.detach())

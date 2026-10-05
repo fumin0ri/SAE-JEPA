@@ -131,14 +131,21 @@ def test_reconstruction_sigreg_covariance_trains_and_resumes(manifest, tmp_path,
         cfg.covariance.weight = 0.5
         cfg.covariance.sketch_dim = 4
         cfg.covariance.estimator = estimator
+        # Exercise a beta warmup that the interrupted run below resumes across.
+        cfg.covariance.warmup_steps = 6 if estimator == "split_half_corr" else 0
         return Trainer(cfg)
 
     trainer = make(tmp_path / "a")
+    if estimator == "split_half_corr":
+        trainer.step = 3  # loss() reads the step; restored before training below
     assert trainer.convention["covariance"]["estimator"] == estimator
     _, metrics = trainer.loss(next(trainer.data), diagnostics=True)
     assert metrics["sigreg"] > 0
     assert metrics["covariance"] > 0 if estimator == "plugin" else metrics["covariance"] != 0
-    assert metrics["covariance_weighted"] == pytest.approx(0.5 * metrics["covariance"])
+    beta = 0.25 if estimator == "split_half_corr" else 0.5
+    assert metrics["covariance_weight_effective"] == pytest.approx(beta)
+    assert metrics["covariance_weighted"] == pytest.approx(beta * metrics["covariance"])
+    trainer.step = 0
     full = make(tmp_path / "b")
     full.run()
     part = make(tmp_path / "c")

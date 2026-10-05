@@ -125,7 +125,8 @@ def test_split_half_corr_estimates_squared_correlation(rho):
 
 @pytest.mark.parametrize("override", ["covariance.weight=-1", "covariance.weight=.nan",
     "covariance.weight=.inf", "covariance.sketch_dim=0", "covariance.sketch_dim=1.5",
-    "covariance.sketch_dim=512", "covariance.sketch_dim=4097", "covariance.estimator=bogus"])
+    "covariance.sketch_dim=512", "covariance.sketch_dim=4097", "covariance.estimator=bogus",
+    "covariance.warmup_steps=-1", "covariance.warmup_steps=1.5"])
 def test_invalid_settings(override):
     with pytest.raises(ValueError, match="covariance"):
         load_config(overrides=["model.type=masked_sigreg_encoder", "sigreg.weight=.1",
@@ -177,6 +178,33 @@ def test_objective_gradients_evaluation_and_exact_resume(manifest, tmp_path, mas
     resumed.cfg.covariance.estimator = "split_half" if estimator == "plugin" else "plugin"
     with pytest.raises(ValueError, match="covariance.estimator"):
         MaskedTrainer(resumed.cfg).load_checkpoint(checkpoint)
+
+
+def test_warmup_ramps_beta_linearly_and_keeps_projection_stream(manifest, tmp_path):
+    def make(path, warmup):
+        cfg = config(manifest, path)
+        cfg.covariance.weight = 2.0
+        cfg.covariance.sketch_dim = 4
+        cfg.covariance.estimator = "split_half_corr"
+        cfg.covariance.warmup_steps = warmup
+        return MaskedTrainer(cfg)
+
+    trainer = make(tmp_path / "warm", 4)
+    assert trainer.convention["covariance"]["warmup_steps"] == 4
+    for step, beta in ((0, 0), (1, .5), (2, 1), (4, 2), (9, 2)):
+        trainer.step = step
+        assert trainer.covariance_weight() == beta
+    trainer.step = 1
+    loss, metrics = trainer.loss(next(trainer.data), True)
+    assert metrics["covariance_weight_effective"] == pytest.approx(.5)
+    assert metrics["covariance_weighted"] == pytest.approx(.5 * metrics["covariance"])
+    assert float(loss.detach()) == pytest.approx(
+        metrics["consistency_mse"] + metrics["sigreg_weighted"] + metrics["covariance_weighted"])
+    # Warmup changes only the weight: the sketch RNG advances exactly as without it.
+    cold = make(tmp_path / "cold", 0)
+    cold.loss(next(cold.data), False)
+    assert torch.equal(trainer.covariance_generator.get_state(), cold.covariance_generator.get_state())
+    assert cold.covariance_weight() == 2.0
 
 
 def test_disabled_skips_sketch_and_old_checkpoint_remains_resumable(manifest, tmp_path, monkeypatch):
