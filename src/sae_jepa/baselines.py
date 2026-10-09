@@ -12,13 +12,13 @@ from .data import write_json
 from .input_whitening import fit as fit_zca
 
 FORMAT = "sae-jepa-baseline-frontend-v1"
-KINDS = ("raw", "zca")
+KINDS = ("raw", "zca", "pca")
 
 
 class BaselineFrontend(nn.Module):
     def __init__(self, kind, normalization, whitening=None):
         super().__init__()
-        if kind not in KINDS or (kind == "zca") != (whitening is not None):
+        if kind not in KINDS or (kind in {"zca", "pca"}) != (whitening is not None):
             raise ValueError("invalid baseline kind or missing whitening statistics")
         mean = normalization["mean"].float()
         scale = float(normalization["scale"])
@@ -45,13 +45,13 @@ class BaselineFrontend(nn.Module):
     def encode_dense(self, h):
         with torch.autocast(device_type=h.device.type, enabled=False):
             x = (h.float() - self.input_mean) / self.input_scale
-            if self.cfg.type == "zca":
+            if self.cfg.type in {"zca", "pca"}:
                 x = (x - self.whitening_center) @ self.whitening_matrix
             return x
 
     def decode_normalized(self, y):
         with torch.autocast(device_type=y.device.type, enabled=False):
-            if self.cfg.type == "zca":
+            if self.cfg.type in {"zca", "pca"}:
                 return y.float() @ self.inverse_whitening_matrix + self.whitening_center
             return y.float()
 
@@ -65,7 +65,7 @@ def build_baseline(front):
     kind = front["config"]["model"]["type"]
     state = front["model"]
     whitening = ({"matrix": state["whitening_matrix"], "center": state["whitening_center"]}
-                 if kind == "zca" else None)
+                 if kind in {"zca", "pca"} else None)
     model = BaselineFrontend(kind, front["normalization"], whitening)
     for key in ("input_mean", "input_scale"):
         if not torch.equal(state[key], model.state_dict()[key]):
@@ -96,18 +96,18 @@ def prepare(args):
     if normalization.get("split", "train") != "train":
         raise ValueError("baseline normalization must be train-only")
     normalization["split"] = "train"
-    whitening = None
-    if "zca" in args.kinds:
-        print("Fitting full-dimensional ZCA on train activations only", flush=True)
-        whitening = fit_zca(source, normalization, epsilon=args.epsilon,
-            maximum_positions=args.maximum_positions, chunk_size=args.chunk_size,
-            sample_seed=args.sample_seed, device=args.device)
     output.mkdir(parents=True, exist_ok=True)
     for kind in args.kinds:
-        model = BaselineFrontend(kind, normalization, whitening if kind == "zca" else None)
+        whitening = None
+        if kind != "raw":
+            print(f"Fitting full-dimensional {kind.upper()} on train activations only", flush=True)
+            whitening = fit_zca(source, normalization, epsilon=args.epsilon,
+                maximum_positions=args.maximum_positions, chunk_size=args.chunk_size,
+                sample_seed=args.sample_seed, device=args.device, kind=kind)
+        model = BaselineFrontend(kind, normalization, whitening)
         # Only data policy is inherited; no learned encoder, readout, or input
         # whitening from the reference is part of either baseline.
-        cfg = {"name": "Raw" if kind == "raw" else "ZCA whitening",
+        cfg = {"name": "Raw" if kind == "raw" else f"{kind.upper()} whitening",
                "model": {"type": kind, "d_in": source.d_in, "d_latent": source.d_in},
                "data": deepcopy(front["config"]["data"]), "sigreg": {"weight": 0.0}}
         cfg["data"]["activation_manifest"] = str(source.manifest_path)
@@ -115,7 +115,7 @@ def prepare(args):
         provenance = {"reference_checkpoint": str(args.reference_checkpoint),
                       "reference_sha256": front["sha256"],
                       "kind": kind, "dimension_reduction": False}
-        if kind == "zca":
+        if kind in {"zca", "pca"}:
             provenance["whitening"] = {
                 k: v.tolist() if isinstance(v, torch.Tensor) else v
                 for k, v in whitening.items() if k not in {"mean", "center", "matrix"}}

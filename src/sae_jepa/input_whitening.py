@@ -14,7 +14,9 @@ FORMAT = 'sae-jepa-input-zca-v1'
 
 
 @torch.no_grad()
-def fit(source, normalization, *, epsilon=1e-4, maximum_positions=0, chunk_size=2048, device='cpu', sample_seed=1729):
+def fit(source, normalization, *, epsilon=1e-4, maximum_positions=0, chunk_size=2048, device='cpu', sample_seed=1729, kind='zca'):
+    if kind not in {'zca', 'pca'}:
+        raise ValueError('whitening kind must be zca or pca')
     check_normalization_matches(normalization, source)
     if not math.isfinite(epsilon) or epsilon <= 0 or maximum_positions < 0 or chunk_size < 1:
         raise ValueError('epsilon must be positive; invalid sampling/chunk settings')
@@ -63,10 +65,14 @@ def fit(source, normalization, *, epsilon=1e-4, maximum_positions=0, chunk_size=
             used.append({'entry': entry, 'count': used_count})
     if count < 2:
         raise ValueError('whitening requires at least two train samples')
-    eigenvalues, u = torch.linalg.eigh(m2/count)
+    eigenvalues, u = torch.linalg.eigh(m2/(count - 1 if kind == 'pca' else count))
     eigenvalues = eigenvalues.clamp_min(0)
-    matrix = (u * (eigenvalues+epsilon).rsqrt()[None, :]) @ u.T
-    return {'format': FORMAT, 'split': 'train', 'mean': normalization['mean'].clone(), 'scale': scale,
+    matrix = u * (eigenvalues+epsilon).rsqrt()[None, :]
+    matrix = matrix @ u.T if kind == 'zca' else matrix.flip(1)
+    convention = ('x=(h-mu)/s; z=(x-center) U diag((eigenvalues+epsilon)^-1/2)'
+                  + (' U^T' if kind == 'zca' else '; descending eigenvalues; covariance denominator n-1')
+                  + '; no dimension reduction')
+    return {'format': FORMAT if kind == 'zca' else 'sae-jepa-input-pca-v1', 'split': 'train', 'mean': normalization['mean'].clone(), 'scale': scale,
             'shards': source.paths('train'), 'burn_in_excluded': source.burn_in,
             'manifest_fingerprint': source.fingerprint, 'd_in': d, 'count': count,
             'used_shards': used, 'maximum_positions': maximum_positions,
@@ -75,7 +81,7 @@ def fit(source, normalization, *, epsilon=1e-4, maximum_positions=0, chunk_size=
             'epsilon': epsilon, 'center': mean.cpu().float(), 'matrix': matrix.cpu().float(),
             'train_eigenvalues': eigenvalues.flip(0).cpu(),
             'expected_transformed_eigenvalues': (eigenvalues/(eigenvalues+epsilon)).flip(0).cpu(),
-            'convention': 'x=(h-mu)/s; z=(x-center) U diag((eigenvalues+epsilon)^-1/2) U^T; no dimension reduction'}
+            'convention': convention}
 
 
 def validate(stats, source, normalization):

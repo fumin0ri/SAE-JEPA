@@ -36,6 +36,7 @@ class Stage2Config:
     decay_fraction: float = 0.2
     gradient_clip: float = 1.0
     amp_dtype: str = "bfloat16"
+    reconstruction_space: str = "latent"
     shards_per_window: int = 4
     calibration_batches: int = 64
     calibration_seed: int = 91001
@@ -49,6 +50,8 @@ class Stage2Config:
     required_splits: tuple[str, ...] = ("validation",)
 
     def validate(self):
+        if self.reconstruction_space not in {"latent", "activation"}:
+            raise ValueError("reconstruction_space must be latent or activation")
         for key in ["dictionary_size", "k", "steps", "batch_size", "shards_per_window",
                     "calibration_batches", "eval_batch_size", "eval_batches", "validation_batches",
                     "log_every", "checkpoint_every"]:
@@ -320,7 +323,15 @@ class Stage2Trainer:
         self.optimizer.zero_grad(set_to_none=True)
         with _autocast(self.device, cfg.amp_dtype):
             prediction, z = self.sae(u)
-            loss = (prediction.float() - u).square().mean()
+            latent_mse = (prediction.float() - u).square().mean()
+        loss = latent_mse
+        if cfg.reconstruction_space == "activation":
+            # Keep the frozen inverse transform in the autograd graph: the SAE
+            # optimizes reconstruction after dewhitening (paper section 5.2).
+            with torch.autocast(device_type=self.device.type, enabled=False):
+                y_hat = prediction.float() * self.calibration["scale"] + self.mean
+                h_hat = self.frontend.denormalize(self.frontend.decode_normalized(y_hat))
+                loss = (h_hat - h.float()).square().mean()
         if not torch.isfinite(loss):
             raise ValueError("nonfinite stage-2 training loss")
         loss.backward()
@@ -332,7 +343,7 @@ class Stage2Trainer:
         with torch.no_grad():
             active = z > 0
             self.firing_counts += active.sum(0)
-        return {"normalized_latent_mse": float(loss.detach()), "lr": lr, "gradient_norm": float(norm),
+        return {"loss": float(loss.detach()), "normalized_latent_mse": float(latent_mse.detach()), "lr": lr, "gradient_norm": float(norm),
                 "l0_mean": float(active.sum(1).float().mean()),
                 "never_fired_fraction": float((self.firing_counts == 0).float().mean())}
 
@@ -438,7 +449,7 @@ def write_report(root, split="validation"):
     ax.bar([v - .18 for v in x], [r['frontend']['fvu']*100 for r in rows], width=.36, label="Frontend only")
     ax.bar([v + .18 for v in x], [r['end_to_end']['fvu']*100 for r in rows], width=.36, label="Frontend + Top-K SAE")
     labels = [r.get('frontend_name', r.get('frontend_type', ''))
-              if r.get('frontend_type') in {'raw', 'zca'}
+              if r.get('frontend_type') in {'raw', 'zca', 'pca'}
               else f"λ={r['frontend_lambda']:g}" + (f"\nβ={r['frontend_covariance_weight']:g}"
                    if r.get('frontend_covariance_weight') else "") for r in rows]
     ax.set_xticks(x, labels)
@@ -453,7 +464,7 @@ def main(argv=None):
     p.add_argument("--reference-checkpoint", required=True)
     p.add_argument("--activation-manifest")
     p.add_argument("--output", required=True)
-    p.add_argument("--kinds", nargs="+", choices=["raw", "zca"], default=["raw", "zca"])
+    p.add_argument("--kinds", nargs="+", choices=["raw", "zca", "pca"], default=["raw", "zca"])
     p.add_argument("--epsilon", type=float, default=1e-4)
     p.add_argument("--maximum-positions", type=int, default=262144)
     p.add_argument("--chunk-size", type=int, default=2048)

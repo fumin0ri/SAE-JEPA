@@ -143,3 +143,38 @@ def test_reject_corrupt_or_changed_baseline(baselines, tmp_path):
     torch.save(state, repaired_hash)
     with pytest.raises(ValueError, match='changed'):
         Stage2Trainer(repaired_hash, tmp_path / 'resume', settings(), 'cpu', resume=True)
+
+
+def test_pca_paper_covariance_inverse_and_activation_loss(baselines, tmp_path):
+    ref, _, _ = baselines
+    output = tmp_path / 'pca'
+    main(['prepare-baselines', '--reference-checkpoint', str(ref), '--output', str(output),
+          '--kinds', 'pca', '--maximum-positions', '0'])
+    path = output / 'pca.pt'
+    model, state = load_front(path)
+    source = source_for(state)
+    h = torch.cat([source.positions(p) for p in source.paths('train')])
+    x = (h.double() - model.input_mean.double()) / model.input_scale.double()
+    covariance = torch.cov(x.T)
+    w = model.whitening_matrix.double()
+    eps = state['baseline_provenance']['whitening']['epsilon']
+    torch.testing.assert_close(w.T @ (covariance + eps * torch.eye(len(w))) @ w,
+                               torch.eye(len(w), dtype=torch.float64), atol=2e-5, rtol=2e-5)
+    z = model.encode_dense(h)
+    torch.testing.assert_close(model.denormalize(model.decode_normalized(z)), h.float(), atol=2e-5, rtol=2e-5)
+    cfg = settings()
+    cfg.reconstruction_space = 'activation'
+    trainer = Stage2Trainer(path, tmp_path / 'pca-train', cfg, 'cpu')
+    batch = next(trainer.data)
+    trainer.data = iter([batch])
+    with torch.no_grad():
+        u = (model.encode_dense(batch) - trainer.mean) / trainer.calibration['scale']
+        prediction, _ = trainer.sae(u)
+        h_hat = model.denormalize(model.decode_normalized(
+            prediction * trainer.calibration['scale'] + trainer.mean))
+        expected_loss = (h_hat - batch).square().mean().item()
+    metrics = trainer.train_step()
+    assert metrics['loss'] == pytest.approx(expected_loss)
+    # Warmup starts at zero LR; gradients still must pass through the inverse.
+    assert metrics['gradient_norm'] > 0
+    assert all(torch.isfinite(p.grad).all() for p in trainer.sae.parameters() if p.grad is not None)

@@ -1,5 +1,41 @@
 # A/B baseline：Raw / ZCA → Top-K SAE
 
+## 論文を参考にしたRaw / PCA、100k step
+
+[Data Whitening Improves Sparse Autoencoder Learning, §5.2](https://arxiv.org/html/2511.13981v1#S5.SS2)
+のPCA変換と逆変換後の再構成損失に対応する場合は、次を使用します。
+既存のZCA条件とは別条件です。
+
+```bash
+pip install -e .
+REFERENCE=runs/stage1/ablation-lambda-0-beta-0-dim-256-100k-decay50/checkpoints/latest.pt \
+ACTIVATION_MANIFEST=/home/iwasaki/LeJEPA-SAE/data/the-pile/pythia-6.9b/layer-16-ctx1024-100m/manifest.json \
+SEEDS="42 43 44" \
+bash scripts/baseline_sae_100k.sh
+```
+
+`REFERENCE`は手元にある入力次元＝出力次元のStage1 checkpointへ変更してください。
+利用するのはtrain正規化・split・先頭除外の設定だけで、encoder重みは使いません。
+Rawにも平均除去と共通スカラー正規化、両条件にStage2 calibrationが入ります。
+正規化も一切しない生の数値入力を意味するものではありません。
+
+PCAはtrainから262,144位置を抽出し、`x=(h-mu)/s`の標本共分散（分母n−1）を推定します。
+行ベクトル表記で `z=(x-c) U diag((lambda+epsilon)^(-1/2))`、全次元保持、
+固有値の降順です。保存した変換の逆行列で元activationに戻します。
+`epsilon=1e-4`はこのリポジトリでの選択（スカラー正規化後の単位）であり、
+論文本文に指定された値ではありません。fit件数も今回の実験設定です。
+
+`reconstruction_space=activation`では元のactivationのMSEに勾配を流します。
+既定の`latent`は従来どおりcalibration後のSAE入力空間のMSEです。
+論文のモデル・K・学習予算すべてを再現する実験ではありません。
+辞書65,536、K=64、batch512、100,000 step、lr=1e-4、warmup500、末尾20% decay。
+1条件・1seedあたり51.2M提示トークン。既存のlatent損失の実験とは損失も異なります。
+
+出力は `runs/baseline-raw-pca-64k-100k/seed-*/model-00` がRaw、`model-01`がPCA。
+1seedだけなら`SEEDS=42`。再開は同じ環境変数に`RESUME=1`を追加します。
+`RUN_ROOT`で保存先を変更できます。前段fit途中の失敗時は新しい出力先を使ってください。
+比較には逆変換後の`end_to_end.fvu`を使います。
+
 `sj-stage2 prepare-baselines`で固定前段を作り、既存の`train` / `sweep` /
 `evaluate` / `sj-probe`をそのまま使います。前段のニューラルネット学習はありません。
 
