@@ -1,5 +1,8 @@
 """Dense reconstruction + SIGReg autoencoder (``model.type = dense_sigreg_ae``).
 
+``whitened_residual_ae`` (below) is the same objective on a frozen whitening
+with a zero-initialized residual encoder.
+
     x     = (h - mu) / s                 train-only mean vector, scalar scale
     y     = G_theta(x)                   Linear -> GELU -> Linear, no output activation
     x_hat = D_phi(y)                     one unconstrained Linear layer
@@ -71,9 +74,61 @@ class DenseSIGRegAE(nn.Module):
         return {"x": x, "y": y, "x_hat": self.decode_normalized(y)}
 
 
+class WhitenedResidualAE(DenseSIGRegAE):
+    """Near-identity Gaussianizer on top of a frozen whitening (``whitened_residual_ae``).
+
+        x     = (h - mu) / s
+        z     = (x - c) W                 frozen train-fit PCA/ZCA, float32, no TF32
+        y     = z + G_theta(z)            last Linear of G zero-initialized: y = z at step 0
+        x_hat = D_phi(y)                  D initialized to the exact inverse whitening
+
+    At initialization ``y`` is the whitening baseline and reconstruction is exact,
+    so whatever SIGReg changes is measured against linear whitening alone.
+    The whitening buffers are installed with ``input_whitening.install``.
+    """
+
+    def __init__(self, cfg: ModelConfig, mean: torch.Tensor, scale: float):
+        if cfg.d_latent != cfg.d_in:
+            raise ValueError("whitened_residual_ae requires model.d_latent == d_in")
+        super().__init__(cfg, mean, scale)
+
+    @torch.no_grad()
+    def initialize_identity(self) -> None:
+        """Zero the residual branch and set the decoder to the inverse whitening."""
+        if not hasattr(self, "whitening_matrix"):
+            raise ValueError("install the whitening before initializing")
+        self.encoder[-1].weight.zero_()
+        self.encoder[-1].bias.zero_()
+        inverse = torch.linalg.inv(self.whitening_matrix.double())
+        if not torch.isfinite(inverse).all():
+            raise ValueError("whitening matrix is not invertible")
+        self.decoder.weight.copy_(inverse.T.float())
+        self.decoder.bias.copy_(self.whitening_center)
+
+    def whiten(self, x: torch.Tensor) -> torch.Tensor:
+        if not hasattr(self, "whitening_matrix"):
+            raise ValueError("whitened_residual_ae has no whitening installed")
+        # Same precision policy as the whitened masked encoder: no bf16, no TF32.
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            previous = torch.backends.cuda.matmul.allow_tf32
+            try:
+                if x.device.type == "cuda":
+                    torch.backends.cuda.matmul.allow_tf32 = False
+                return (x.float() - self.whitening_center) @ self.whitening_matrix
+            finally:
+                if x.device.type == "cuda":
+                    torch.backends.cuda.matmul.allow_tf32 = previous
+
+    def encode_normalized(self, x: torch.Tensor) -> torch.Tensor:
+        z = self.whiten(x)
+        return z + self.encoder(z).float()
+
+
 def build_model(cfg: ModelConfig, mean: torch.Tensor, scale: float) -> nn.Module:
     if cfg.type == "dense_sigreg_ae":
         return DenseSIGRegAE(cfg, mean, scale)
+    if cfg.type == "whitened_residual_ae":
+        return WhitenedResidualAE(cfg, mean, scale)
     if cfg.type == "masked_sigreg_encoder":
         return MaskedSIGRegEncoder(cfg, mean, scale)
     raise ValueError(f"unknown model.type {cfg.type!r}")

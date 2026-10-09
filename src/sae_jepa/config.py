@@ -10,13 +10,19 @@ from typing import Any
 import yaml
 
 
+RECONSTRUCTION_TYPES = ("dense_sigreg_ae", "whitened_residual_ae")
+MODEL_TYPES = RECONSTRUCTION_TYPES + ("masked_sigreg_encoder",)
+
+
 @dataclass
 class DataConfig:
     activation_manifest: str = ""
     # Train-only statistics from ``sj-compute-normalization``.  When empty,
     # they are computed at startup and saved next to the run.
     normalization_path: str = ""
-    input_whitening_path: str = ""  # frozen train-fit ZCA; SIGReg-only ablation
+    # Frozen train-fit whitening: ZCA for the SIGReg-only ablation, or a ZCA/PCA
+    # fit or baseline front-end (pca.pt) for model.type=whitened_residual_ae.
+    input_whitening_path: str = ""
     skip_burn_in: bool = True
     # Drop token positions < k of every stored sequence from normalization,
     # training and evaluation (1 = drop the first token of each segment, whose
@@ -164,9 +170,9 @@ class ExperimentConfig:
         if cc.estimator not in ("plugin", "split_half", "split_half_corr"):
             raise ValueError("covariance.estimator must be 'plugin', 'split_half' or 'split_half_corr'")
         if cc.weight > 0:
-            if self.model.type not in {"dense_sigreg_ae", "masked_sigreg_encoder"}:
-                raise ValueError("covariance requires dense_sigreg_ae or masked_sigreg_encoder")
-            if self.model.type == "dense_sigreg_ae" and not self.sigreg.weight > 0:
+            if self.model.type not in MODEL_TYPES:
+                raise ValueError("covariance requires a dense_sigreg_ae, whitened_residual_ae or masked_sigreg_encoder model")
+            if self.model.type in RECONSTRUCTION_TYPES and not self.sigreg.weight > 0:
                 raise ValueError("dense covariance (reconstruction + SIGReg + cov) requires sigreg.weight > 0")
             if cc.sketch_dim > self.model.d_latent or cc.sketch_dim >= self.optim.batch_size:
                 raise ValueError("covariance.sketch_dim must be <= d_latent and < training batch size")
@@ -174,13 +180,16 @@ class ExperimentConfig:
                 raise ValueError("covariance.sketch_dim must be < evaluation batch size")
             if cc.estimator != "plugin" and min(self.optim.batch_size, self.eval.batch_size) < 4:
                 raise ValueError(f"covariance.estimator={cc.estimator} requires batch sizes >= 4")
-        if self.data.input_whitening_path and (self.model.type != "masked_sigreg_encoder" or self.masking.enabled):
-            raise ValueError("input whitening currently requires SIGReg-only (masked encoder, masking.enabled=false)")
+        if self.model.type == "whitened_residual_ae":
+            if not self.data.input_whitening_path:
+                raise ValueError("model.type=whitened_residual_ae requires data.input_whitening_path")
+        elif self.data.input_whitening_path and (self.model.type != "masked_sigreg_encoder" or self.masking.enabled):
+            raise ValueError("input whitening requires whitened_residual_ae or SIGReg-only (masked encoder, masking.enabled=false)")
         if not isinstance(self.masking.enabled, bool):
             raise ValueError("masking.enabled must be a boolean")
         if not self.masking.enabled and self.model.type != "masked_sigreg_encoder":
             raise ValueError("masking.enabled=false requires model.type=masked_sigreg_encoder")
-        if self.model.type not in {"dense_sigreg_ae", "masked_sigreg_encoder"}:
+        if self.model.type not in MODEL_TYPES:
             raise ValueError(f"unknown model.type {self.model.type!r}")
         if not 0 < self.masking.probability < 1:
             raise ValueError("masking.probability must lie strictly between 0 and 1")

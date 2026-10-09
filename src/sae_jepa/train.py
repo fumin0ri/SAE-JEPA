@@ -160,6 +160,18 @@ class Trainer:
         self.model: DenseSIGRegAE = build_model(
             cfg.model, self.normalization["mean"], self.normalization["scale"]
         ).to(self.device)
+        # whitened_residual_ae: frozen whitening, then y = z exactly at step 0.
+        # Neither step consumes random numbers, so the data order is unchanged.
+        self.input_whitening: dict[str, Any] | None = None
+        if cfg.model.type == "whitened_residual_ae":
+            from .input_whitening import install
+            from .whitened_residual import load_whitening
+
+            self.input_whitening = load_whitening(
+                cfg.data.input_whitening_path, self.source, self.normalization
+            )
+            install(self.model, self.input_whitening)
+            self.model.initialize_identity()
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
             lr=cfg.optim.lr,
@@ -206,6 +218,12 @@ class Trainer:
             resample_every_step=cfg.sigreg.resample_every_step,
             batch_size=cfg.optim.batch_size,
         )
+        if self.input_whitening is not None:
+            self.convention["input_transform"] = self.input_whitening["kind"]
+            self.convention["input_whitening"] = {
+                k: self.input_whitening[k]
+                for k in ("kind", "epsilon", "count", "source_path", "source_sha256", "convention")
+            }
         if self.covariance_generator is not None:
             self.convention["covariance"] = {
                 "weight": cfg.covariance.weight,
@@ -310,7 +328,7 @@ class Trainer:
 
     # ---------------------------------------------------------- checkpoints
     def checkpoint_state(self) -> dict[str, Any]:
-        return {
+        state = {
             "format": CHECKPOINT_FORMAT,
             "architecture_id": ARCHITECTURE_ID,
             "step": self.step,
@@ -341,6 +359,9 @@ class Trainer:
             "config": config_to_dict(self.cfg),
             "sigreg_convention": self.convention,
         }
+        if getattr(self, "input_whitening", None) is not None:
+            state["input_whitening"] = self.input_whitening
+        return state
 
     def save_checkpoint(self) -> Path:
         """Atomically write ``checkpoints/latest.pt`` (the only file that resume,
@@ -383,6 +404,12 @@ class Trainer:
             and saved_norm["scale"] == self.normalization["scale"]
         ):
             raise ValueError("cannot resume: normalization statistics differ from the checkpoint")
+        if self.cfg.model.type == "whitened_residual_ae":
+            from .whitened_residual import check_same
+
+            if "input_whitening" not in state:
+                raise ValueError("cannot resume: checkpoint has no whitening")
+            check_same(state["input_whitening"], self.input_whitening)
         self.model.load_state_dict(state["model"])
         self.optimizer.load_state_dict(state["optimizer"])
         self.scheduler.load_state_dict(state["scheduler"])
