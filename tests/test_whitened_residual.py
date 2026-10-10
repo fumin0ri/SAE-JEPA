@@ -62,6 +62,27 @@ def test_starts_exactly_at_the_whitening_baseline(manifest, tmp_path, whitening)
     torch.testing.assert_close(from_fit.model(h)['y'], out['y'], atol=1e-5, rtol=1e-5)
 
 
+def test_paired_diagnostic_restores_initial_without_changing_checkpoint(manifest, tmp_path, whitening):
+    from sae_jepa.paired_whitening import diagnose
+    from sae_jepa.stage2 import tensor_hash
+    normalization, pca_path, _ = whitening
+    trainer = Trainer(config(manifest, tmp_path / 'paired', normalization, pca_path))
+    checkpoint = trainer.save_checkpoint()
+    initial = diagnose(checkpoint, tmp_path / 'initial-diagnostic', device='cpu', batches=2)
+    assert all(v['delta'] == 0 for v in initial['metrics'].values())
+    with torch.no_grad():
+        trainer.model.encoder[-1].bias.add_(0.2)
+    checkpoint = trainer.save_checkpoint()
+    original_hash = tensor_hash(trainer.model.state_dict())
+    result = diagnose(checkpoint, tmp_path / 'changed-diagnostic', device='cpu', batches=2)
+    assert result['sample_sha256'] == initial['sample_sha256']
+    for k, v in result['metrics'].items():
+        assert v['before'] == initial['metrics'][k]['before']
+    assert result['metrics']['gaussian/heldout_sigreg']['delta'] != 0
+    saved, _ = load_checkpoint_model(checkpoint, torch.device('cpu'))
+    assert tensor_hash(saved.state_dict()) == original_hash
+
+
 def test_trains_resumes_and_is_a_stage2_frontend(manifest, tmp_path, whitening):
     normalization, pca_path, zca_path = whitening
     make = lambda name: Trainer(config(manifest, tmp_path / name, normalization, pca_path))

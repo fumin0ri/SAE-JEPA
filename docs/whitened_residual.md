@@ -1,5 +1,39 @@
 # PCA whitening上の恒等残差AE（`whitened_residual_ae`）
 
+## λ=0対照と固定標本の学習前後診断
+
+```bash
+pip install -e .
+ACTIVATION_MANIFEST=/home/iwasaki/LeJEPA-SAE/data/the-pile/pythia-6.9b/layer-16-ctx1024-100m/manifest.json \
+NORMALIZATION=runs/stage1/rec-sigreg-cov/normalization.pt \
+WHITENING=runs/baseline-raw-pca-64k-100k/frontends/pca.pt \
+bash scripts/whitened_residual_control.sh
+```
+
+新規学習はλ=0、100k stepのStage1だけです。SAE/probeは実行しません。
+λ=0.001/0.01には`runs/whitened-residual-100k`の既存checkpointを使います。
+対照は`runs/whitened-residual-control-100k`、診断は
+`runs/whitened-residual-paired-diagnostics/lambda-*/seed-42/{none,bfloat16}`です。
+各ディレクトリに`before.json`、`after.json`、スペクトル、`comparison.json`を保存します。
+
+学習後checkpoint内の固定whiteningから、残差branchの最終層をゼロにし、
+decoderを逆変換に戻すことで、初期状態の関数`y=z`を復元します。
+checkpoint自体は変更しません。学習初期の重みを推測して再生成する方式ではありません。
+前後とも同じvalidation標本（64×512=32768位置、eval.sample_seed）、
+同じheld-out/diagnostic射影、同じGaussian参照を使います。
+実際に読んだactivation列のSHA256を記録し、前後で違えば停止します。
+`none`はFP32、`bfloat16`は学習時のautocast方針です。
+異なるprecision間や、既存8192位置の学習ログとは分けて比較してください。
+
+`comparison.json`のdeltaはafter−beforeです。SIGReg/W2/cov deviation/FVUは
+負なら改善、有効ランクは大きさだけでGaussian性を判断しません。
+λ=0でも変化するか、λ>0だけでSIGRegが改善するか、precisionで差があるかを調べます。
+SIGRegは二次統計にも反応するので、高次統計だけの改善とは断定できません。
+
+既存パスは`EXISTING_ROOT`、対照は`CONTROL_ROOT`、診断保存先は`DIAGNOSTIC_ROOT`で変更できます。
+`SKIP_TRAIN=1`は対照の学習済みcheckpointがある場合に指定します。
+診断の出力は空のディレクトリが必要です。診断の再実行時は新しい`DIAGNOSTIC_ROOT`を指定してください。
+
 SIGRegによる非線形のガウス化が、線形whitening（PCA baseline）に何かを上乗せするかを調べる前段です。
 従来の`dense_sigreg_ae`は白色化そのものをencoderで一から学ぶため、Stage1でFVUを約10%失っていました。
 そのため、PCAとの差に「高次のガウス化の効果」と「情報損失」が混ざっていました。

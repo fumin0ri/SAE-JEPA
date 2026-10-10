@@ -25,6 +25,7 @@ visible.  Dense-model-only: there are no dead-feature or firing-rate metrics.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import math
 from pathlib import Path
 from typing import Any
@@ -411,6 +412,7 @@ def evaluate_model(
     sum_h = torch.zeros(d_in, dtype=torch.float64, device=device)
     sum_h_sq = 0.0
     batches = 0
+    sample_digest = hashlib.sha256()
     diagnostics = (
         _OutlierDiagnostics(d_latent, device, eval_cfg, source.paths(split)) if detailed else None
     )
@@ -419,6 +421,7 @@ def evaluate_model(
         with_metadata=detailed,
     ):
         batch, meta = item if detailed else (item, None)
+        sample_digest.update(batch.detach().cpu().float().contiguous().numpy().tobytes())
         h = batch.to(device).float()
         with _autocast(device, amp_dtype):
             out = model(h)
@@ -449,6 +452,7 @@ def evaluate_model(
         "batches": batches,
         "batch_size": batch_size,
         "detailed": detailed,
+        "sample_sha256": sample_digest.hexdigest(),
         "reconstruction/mse": sse / (n * d_in),
         "reconstruction/fvu": sse / max(total_variation, 1e-30),
         "reconstruction/normalized_mse": sse_normalized / (n * d_in),
